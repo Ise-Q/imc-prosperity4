@@ -32,25 +32,74 @@ Each round gets its own folder. We follow the pattern `roundN/` where N is the r
 
 ## Git Workflow
 
-We use a branch per round to keep work isolated.
+We use a three-level branch structure so teammates can work independently without stepping on each other's notebooks.
+
+```
+main                    ← submissions only; never commit directly
+└── round1              ← shared round branch (one person sets this up)
+    ├── round1-alice    ← alice's personal notebooks/analysis
+    └── round1-jay      ← jay's personal notebooks/analysis
+```
+
+### Setup — once per round (one person does this)
 
 ```bash
-# Start of a new round — create a branch
+git checkout main
 git checkout -b round1
-
-# Work on your notebook or trader.py...
-
-# Stage and commit your changes
-git add round1/
-git commit -m "round1: add EDA notebook for EMERALDS"
-
-# Push to GitHub
 git push -u origin round1
 ```
 
-After a round is complete, open a Pull Request on GitHub to merge `round1` into `main`.
+### Each teammate branches off round1
 
-**Never commit directly to `main`.**
+```bash
+git fetch origin
+git checkout round1
+git checkout -b round1-yourname    # e.g. round1-jay
+git push -u origin round1-yourname
+```
+
+### Daily habit — save your work
+
+```bash
+git add round1/notebooks/my_eda.ipynb
+git commit -m "round1: tried momentum strategy on KELP"
+git push origin round1-yourname
+```
+
+### Stay in sync with teammates
+
+```bash
+git fetch origin
+git merge origin/round1    # pull in anything merged to the shared round branch
+```
+
+### Merge into round1 (when combining work / writing final trader.py)
+
+```bash
+git checkout round1
+git merge round1-alice
+git merge round1-jay
+git push origin round1
+```
+
+Discuss findings here, then write the final `trader.py` on `round1`.
+
+### Submit — merge into main (only when trader.py is final and agreed on)
+
+```bash
+git checkout main
+git merge round1
+git push origin main
+```
+
+### Rules
+
+| Rule | Why |
+|---|---|
+| Never commit directly to `main` | Keeps submissions clean and reviewable |
+| Each person works on their own branch | No notebook merge conflicts |
+| Pull from `round1` regularly | Stay in sync with teammate's findings |
+| Only merge into `main` when `trader.py` is final | `main` = submission history only |
 
 ---
 
@@ -306,6 +355,7 @@ Check that:
 | Open notebooks | `uv run jupyter notebook` |
 | Run a Python script | `uv run python script.py` |
 | Add a new package | `uv add <package>` |
-| Start a new round branch | `git checkout -b roundN` |
+| Set up shared round branch (one person) | `git checkout main && git checkout -b roundN && git push -u origin roundN` |
+| Start your personal branch | `git checkout roundN && git checkout -b roundN-yourname` |
 
 ---
