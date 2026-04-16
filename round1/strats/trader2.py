@@ -28,7 +28,7 @@ PARAMS = {
 # define default traderData
 def default_traderData():
     # need to fillin
-    return {}
+    return {product: {} for product in PRODUCTS}
 
 # base ProductTrader 
 class ProductTrader:
@@ -65,12 +65,6 @@ class ProductTrader:
             return last_traderData
         else:
             return default_traderData() 
-    
-    def _save_new_traderData(self):
-        if not self.new_traderData:
-            pass
-        else:
-            return jsonpickle.encode(self.new_traderData)
 
     def _get_current_position(self): 
         return self.state.position.get(self.name, 0)
@@ -113,12 +107,12 @@ class ProductTrader:
 
     def get_best_bid(self):
         if self.quoted_buy_orders:
-            return self.quoted_buy_orders.keys()[0]
+            return next(iter(self.quoted_buy_orders))
     
 
     def get_best_ask(self):
         if self.quoted_sell_orders:
-            return self.quoted_sell_orders.key()[0]
+            return next(iter(self.quoted_sell_orders))
 
     def buy(self, price, volume):
         """
@@ -151,11 +145,14 @@ class ProductTrader:
 
         # updated expected position
         self.expected_position -= abs_volume
-        
+
+    def update_traderData(self):
+        self.new_traderData[self.name]["last_timestamp"] = self.timestamp
+
 
     def compute_mid_price(self):
-        bb = self.get_best_bid
-        bo = self.get_best_ask
+        bb = self.get_best_bid()
+        bo = self.get_best_ask()
 
         if bb and bo:
             return (bb + bo) / 2.0
@@ -166,18 +163,38 @@ class ProductTrader:
     def compute_VWAP(self):
         pass
 
-    def compute_make_bid_price(self):
-        # OVERRIDE WITHIN EACH INHERITED CLASS
-        pass
-
     def compute_make_ask_price(self):
-        # OVERRIDE WITHIN EACH INHERITED CLASS
-        pass
+        if not self.quoted_sell_orders:
+            return None
+        best_ask_price = next(iter(self.quoted_sell_orders)) # take lowest sell price with active volume (>1)
+        fair_ask_price = self.fair_value + self.make_margin
 
-    def compute_fair_value():
-        # OVERRIDE WITHIN EACH INHERITED CLASS
-        pass
+        if best_ask_price < fair_ask_price:
+            pass # do nothing if best offer is lower than what we are willing to sell at
+        elif best_ask_price == fair_ask_price:
+            return fair_ask_price
+        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
+            return best_ask_price - 1
     
+    def compute_make_bid_price(self):
+        if not self.quoted_buy_orders:
+            return None 
+        best_bid_price = next(iter(self.quoted_buy_orders)) # take highest bid price with active volume (>1)
+        fair_bid_price = self.fair_value - self.make_margin
+
+        if best_bid_price < fair_bid_price:
+            return fair_bid_price
+        elif best_bid_price == fair_bid_price:
+            return fair_bid_price
+        else: # if best bid price is higher than fair bid price, we undercut it by 1 price tick
+            return best_bid_price - 1
+    
+# conflict with how super.__init()__ for ROOT is called before alpha and beta are defined
+# while compute_fair_value() requires alpha and beta
+#    def compute_fair_value():
+#        # OVERRIDE WITHIN EACH INHERITED CLASS
+#        pass
+
 class StaticTrader(ProductTrader):
     def __init__(self, state, new_traderData):
         super().__init__("ASH_COATED_OSMIUM", state, new_traderData)
@@ -189,32 +206,6 @@ class StaticTrader(ProductTrader):
             raise KeyError(f"fair_value is not a key of PARAMS{self.name}!")
         else:
             return PARAMS[self.name]["fair_value"]
-    
-    def compute_make_ask_price(self):
-        if not self.quoted_sell_orders:
-            return None
-        best_ask_price = self.quoted_sell_orders.keys()[0] # take lowest sell price with active volume (>1)
-        fair_ask_price = self.fair_value + self.make_margin
-
-        if best_ask_price < fair_ask_price:
-            pass # do nothing if best offer is lower than what we are willing to sell at
-        elif best_ask_price == fair_ask_price:
-            return fair_ask_price
-        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
-            return best_ask_price - 1
-    
-    def compute_make_bid_price(self):
-        if not self.quoted_sell_orders:
-            return None
-        best_bid_price = self.quoted_buy_orders.keys()[0] # take highest bid price with active volume (>1)
-        fair_bid_price = self.fair_value - self.make_margin
-
-        if best_bid_price < fair_bid_price:
-            pass # do nothing if best offer is lower than what we are willing to sell at
-        elif best_bid_price == fair_bid_price:
-            return fair_bid_price
-        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
-            return best_bid_price - 1
 
     def get_orders(self):
         """
@@ -278,18 +269,28 @@ class LinearTrendTrader(ProductTrader):
         
         we reverse engineer day_offset at first iteration and save it in traderData
         """
-        day_offset = self.new_traderData.get("day_offset",None)
-        if not day_offset:
+        day_offset = self.last_traderData[self.name].get("day_offset", None)
+        if (day_offset is None):
             # if day offset is not included in trader data, we reverse engineer by using mid price  
             day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
 
             g_time_index = day_offset * 1_000_000 + self.timestamp
             fair = self.alpha + self.beta * g_time_index
-        elif day_offset >= 0: 
+            
+            # update trader data
+            self.new_traderData[self.name]["day_offset"] = day_offset
+
+        else:
             # if day offset is in traderData, use it to compute fair
+            # first check if we should use a new day_offset
+            if self.timestamp < self.last_traderData[self.name]["last_timestamp"]:
+                day_offset += 1 # increment day_offset by 1
+                # update day offset
+                self.new_traderData[self.name]["day_offset"] = day_offset
+            
             g_time_index = day_offset * 1_000_000 + self.timestamp
             fair = self.alpha + self.beta * g_time_index
-        
+
         return round(fair)
             
         
@@ -334,20 +335,29 @@ class LinearTrendTrader(ProductTrader):
 class Trader:
     def run(self, state: TradingState):
         result : Dict[str, List[Order]] = {}
-        # STEP 1:DECODE TraderData
+        # STEP 1:intiialize new traderdata
+        new_traderData = default_traderData()
+
+        # STEP 2: intialize trader classes
+        static_trader = StaticTrader(state, new_traderData)
+        lin_trend_trader = LinearTrendTrader(state, new_traderData)
+
+        # STEP 3: get orders
+        result.update(static_trader.get_orders())
+        result.update(lin_trend_trader.get_orders())
         
-        # STEP 2:UPDATE STATE
-
-        # STEP 3:TRADING LOGIC
-
-        # take
-
-        # clear
-
-        # make
+        # STEP 4: Update TraderData
+        # save timestamp
+        static_trader.update_traderData()
+        lin_trend_trader.update_traderData()
         
-        # STEP 4:ENCODE TraderData
-        traderData = self._save_traderData()
+        new_traderData.update(static_trader.new_traderData)
+        new_traderData.update(lin_trend_trader.new_traderData)
+        
+        
+
+        # STEP 5:ENCODE TraderData
+        traderData = jsonpickle.encode(new_traderData)
         conversions = 0
         return result, conversions, traderData
 
