@@ -15,7 +15,7 @@ POS_LIMITS = {
 }
 PARAMS = {
     "ASH_COATED_OSMIUM": {
-      "static_fair_value": 10_000, "take_margin": 1,
+      "fair_value": 10_000, "take_margin": 1,
       "clear_margin": 0, "make_margin": 1
     },
     "INTARIAN_PEPPER_ROOT":{
@@ -36,6 +36,7 @@ class ProductTrader:
         self.orders = []
         self.name = name
         self.state = state
+        self.timestamp = self.state.timestamp
         self.new_traderData = new_traderData
 
         self.last_traderData = self._get_last_traderData()
@@ -52,6 +53,8 @@ class ProductTrader:
         self.clear_margin = self._get_clear_margin()
         self.make_margin = self._get_make_margin()
 
+        self.fair_value = self.compute_fair_value()
+
     def _get_last_traderData(self):
         if self.state.traderData and self.state.traderData != "":
             try:
@@ -62,6 +65,12 @@ class ProductTrader:
             return last_traderData
         else:
             return default_traderData() 
+    
+    def _save_new_traderData(self):
+        if not self.new_traderData:
+            pass
+        else:
+            return jsonpickle.encode(self.new_traderData)
 
     def _get_current_position(self): 
         return self.state.position.get(self.name, 0)
@@ -103,10 +112,13 @@ class ProductTrader:
         return PARAMS.get(self.name, {}).get("make_margin",1)
 
     def get_best_bid(self):
-        pass
+        if self.quoted_buy_orders:
+            return self.quoted_buy_orders.keys()[0]
+    
 
     def get_best_ask(self):
-        pass
+        if self.quoted_sell_orders:
+            return self.quoted_sell_orders.key()[0]
 
     def buy(self, price, volume):
         """
@@ -142,7 +154,11 @@ class ProductTrader:
         
 
     def compute_mid_price(self):
-        pass
+        bb = self.get_best_bid
+        bo = self.get_best_ask
+
+        if bb and bo:
+            return (bb + bo) / 2.0
 
     def compute_wall_mid(self):
         pass
@@ -166,25 +182,39 @@ class StaticTrader(ProductTrader):
     def __init__(self, state, new_traderData):
         super().__init__("ASH_COATED_OSMIUM", state, new_traderData)
         
-        self.static_fair_value = self.compute_fair_value()
+        self.fair_value = self.compute_fair_value()
 
     def compute_fair_value(self):
-        if "static_fair_value" not in PARAMS[self.name].keys():
-            raise KeyError(f"static_fair_value is not a key of PARAMS{self.name}!")
+        if "fair_value" not in PARAMS[self.name].keys():
+            raise KeyError(f"fair_value is not a key of PARAMS{self.name}!")
         else:
-            return PARAMS[self.name]["static_fair_value"]
+            return PARAMS[self.name]["fair_value"]
     
     def compute_make_ask_price(self):
         if not self.quoted_sell_orders:
             return None
-        self.quoted_sell_orders.keys()[0] # take lowest sell price with active volume (>1)
-        self.q
-        ask_price = self.static_fair_value + self.make_margin
+        best_ask_price = self.quoted_sell_orders.keys()[0] # take lowest sell price with active volume (>1)
+        fair_ask_price = self.fair_value + self.make_margin
+
+        if best_ask_price < fair_ask_price:
+            pass # do nothing if best offer is lower than what we are willing to sell at
+        elif best_ask_price == fair_ask_price:
+            return fair_ask_price
+        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
+            return best_ask_price - 1
     
     def compute_make_bid_price(self):
-        if not self.quoted_buy_orders:
+        if not self.quoted_sell_orders:
             return None
-        self.quoted_buy_orders.keys()[0]
+        best_bid_price = self.quoted_buy_orders.keys()[0] # take highest bid price with active volume (>1)
+        fair_bid_price = self.fair_value - self.make_margin
+
+        if best_bid_price < fair_bid_price:
+            pass # do nothing if best offer is lower than what we are willing to sell at
+        elif best_bid_price == fair_bid_price:
+            return fair_bid_price
+        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
+            return best_bid_price - 1
 
     def get_orders(self):
         """
@@ -192,12 +222,12 @@ class StaticTrader(ProductTrader):
         """
         # STEP 1: take orders first
         for bp, bv in self.quoted_buy_orders.items():
-            if bp < self.static_fair_value + self.take_margin:
+            if bp < self.fair_value + self.take_margin:
                 break # buy_orders are in decreasing order. If first bp is smaller, rest are all smaller. break for faster run
             # hit bid
             self.sell(bp, -bv)
         for sp, sv in self.quoted_sell_orders.items():
-            if sp > self.static_fair_value - self.take_margin:
+            if sp > self.fair_value - self.take_margin:
                 break
             # lift offer
             self.buy(sp, sv)
@@ -206,19 +236,26 @@ class StaticTrader(ProductTrader):
         if self.expected_position > 0:
             # if we sell too much, then orders will get cancelled
             clear_volume = min(self.expected_position, self.max_allowed_sell_volume)
-            clear_price = self.static_fair_value + self.clear_margin # default is zero
+            clear_price = self.fair_value + self.clear_margin # default is zero
             self.sell(clear_price, -clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
         
         elif self.expected_position < 0:
             clear_volume = min(-self.expected_position, self.max_allowed_buy_volume)
-            clear_price = self.static_fair_value - self.clear_margin
+            clear_price = self.fair_value - self.clear_margin
             self.buy(clear_price, clear_volume)
         
         else: # when expected_pos == 0
             pass
 
         # STEP 3: Make orders
+        ask_price = self.compute_make_ask_price()
+        bid_price = self.compute_make_bid_price()
         
+        # default: don't care about inventory as of now, change later
+        if self.max_allowed_sell_volume > 0:
+            self.sell(ask_price, self.max_allowed_sell_volume)
+        if self.max_allowed_buy_volume > 0:
+            self.buy(bid_price, self.max_allowed_buy_volume)
         
 
         return {self.name : self.orders}    
@@ -228,17 +265,77 @@ class StaticTrader(ProductTrader):
 class LinearTrendTrader(ProductTrader):
     def __init__(self, state, new_traderData):
         super().__init__("INTARIAN_PEPPER_ROOT", state, new_traderData)
+        self.alpha = PARAMS[self.name]["intercept"]
+        self.beta = PARAMS[self.name]["slope"]
+        self.fair_value = self.compute_fair_value()
     
     def compute_fair_value(self):
-        pass
+        """
+        fair value is a linear relationship with respect global time index
+        fair = alpha + beta * g_time_index
+        where
+            g_time_index = day_offset * 1e6 + timestamp
+        
+        we reverse engineer day_offset at first iteration and save it in traderData
+        """
+        day_offset = self.new_traderData.get("day_offset",None)
+        if not day_offset:
+            # if day offset is not included in trader data, we reverse engineer by using mid price  
+            day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
 
+            g_time_index = day_offset * 1_000_000 + self.timestamp
+            fair = self.alpha + self.beta * g_time_index
+        elif day_offset >= 0: 
+            # if day offset is in traderData, use it to compute fair
+            g_time_index = day_offset * 1_000_000 + self.timestamp
+            fair = self.alpha + self.beta * g_time_index
+        
+        return round(fair)
+            
+        
     def get_orders(self):
-        pass
+
+        # STEP 1: take orders first
+        for bp, bv in self.quoted_buy_orders.items():
+            if bp < self.fair_value + self.take_margin:
+                break # buy_orders are in decreasing order. If first bp is smaller, rest are all smaller. break for faster run
+            # hit bid
+            self.sell(bp, -bv)
+        for sp, sv in self.quoted_sell_orders.items():
+            if sp > self.fair_value - self.take_margin:
+                break
+            # lift offer
+            self.buy(sp, sv)
+        
+        # STEP 2: clear orders to have enough bullets for next iteration if +EV traders emerge
+        if self.expected_position > 0:
+            # if we sell too much, then orders will get cancelled
+            clear_volume = min(self.expected_position, self.max_allowed_sell_volume)
+            clear_price = self.fair_value + self.clear_margin # default is zero
+            self.sell(clear_price, -clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
+        
+        elif self.expected_position < 0:
+            clear_volume = min(-self.expected_position, self.max_allowed_buy_volume)
+            clear_price = self.fair_value - self.clear_margin
+            self.buy(clear_price, clear_volume)
+        
+        else: # when expected_pos == 0
+            pass
+
+        # STEP 3: Make orders
+        # Since it is an upward trending product, we only make bids
+        bid_price = self.compute_make_bid_price()
+        
+        if self.max_allowed_buy_volume > 0:
+            self.buy(bid_price, self.max_allowed_buy_volume)
+        
+        return {self.name : self.orders}
 
 class Trader:
     def run(self, state: TradingState):
+        result : Dict[str, List[Order]] = {}
         # STEP 1:DECODE TraderData
-
+        
         # STEP 2:UPDATE STATE
 
         # STEP 3:TRADING LOGIC
@@ -250,6 +347,8 @@ class Trader:
         # make
         
         # STEP 4:ENCODE TraderData
-        pass
+        traderData = self._save_traderData()
+        conversions = 0
+        return result, conversions, traderData
 
         
