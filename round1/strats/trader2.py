@@ -1,9 +1,8 @@
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List
-from collections import deque
 import jsonpickle
 import numpy as np
-import pandas as pd
+
 
 # params that can be optimized
 # take_margin, clear_margin
@@ -163,10 +162,10 @@ class ProductTrader:
         pass
 
     def compute_make_ask_price(self):
-        if not self.quoted_sell_orders:
-            return None
-        best_ask_price = next(iter(self.quoted_sell_orders)) # take lowest sell price with active volume (>1)
         fair_ask_price = self.fair_value + self.make_margin
+        if not self.quoted_sell_orders:
+            return fair_ask_price
+        best_ask_price = next(iter(self.quoted_sell_orders)) # take lowest sell price with active volume (>1)
 
         if best_ask_price > fair_ask_price:
             # if ba > fair_ask, we undercut it by 1 price tick
@@ -175,10 +174,10 @@ class ProductTrader:
             return fair_ask_price
     
     def compute_make_bid_price(self):
-        if not self.quoted_buy_orders:
-            return None 
-        best_bid_price = next(iter(self.quoted_buy_orders)) # take highest bid price with active volume (>1)
         fair_bid_price = self.fair_value - self.make_margin
+        if not self.quoted_buy_orders:
+            return fair_bid_price
+        best_bid_price = next(iter(self.quoted_buy_orders)) # take highest bid price with active volume (>1)
 
         if best_bid_price < fair_bid_price:
             # if bb < fair_bid, we overbid bb by 1 price tick
@@ -213,7 +212,7 @@ class StaticTrader(ProductTrader):
             if bp < self.fair_value + self.take_margin:
                 break # buy_orders are in decreasing order. If first bp is smaller, rest are all smaller. break for faster run
             # hit bid
-            self.sell(bp, -bv)
+            self.sell(bp, bv)
         for sp, sv in self.quoted_sell_orders.items():
             if sp > self.fair_value - self.take_margin:
                 break
@@ -225,7 +224,7 @@ class StaticTrader(ProductTrader):
             # if we sell too much, then orders will get cancelled
             clear_volume = min(self.expected_position, self.max_allowed_sell_volume)
             clear_price = self.fair_value + self.clear_margin # default is zero
-            self.sell(clear_price, -clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
+            self.sell(clear_price, clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
         
         elif self.expected_position < 0:
             clear_volume = min(-self.expected_position, self.max_allowed_buy_volume)
@@ -240,9 +239,9 @@ class StaticTrader(ProductTrader):
         bid_price = self.compute_make_bid_price()
         
         # default: don't care about inventory as of now, change later
-        if self.max_allowed_sell_volume > 0:
+        if ask_price is not None and self.max_allowed_sell_volume > 0:
             self.sell(ask_price, self.max_allowed_sell_volume)
-        if self.max_allowed_buy_volume > 0:
+        if bid_price is not None and self.max_allowed_buy_volume > 0:
             self.buy(bid_price, self.max_allowed_buy_volume)
         
 
@@ -298,7 +297,7 @@ class LinearTrendTrader(ProductTrader):
             if bp < self.fair_value + self.take_margin:
                 break # buy_orders are in decreasing order. If first bp is smaller, rest are all smaller. break for faster run
             # hit bid
-            self.sell(bp, -bv)
+            self.sell(bp, bv)
         for sp, sv in self.quoted_sell_orders.items():
             if sp > self.fair_value - self.take_margin:
                 break
@@ -310,7 +309,7 @@ class LinearTrendTrader(ProductTrader):
             # if we sell too much, then orders will get cancelled
             clear_volume = min(self.expected_position, self.max_allowed_sell_volume)
             clear_price = self.fair_value + self.clear_margin # default is zero
-            self.sell(clear_price, -clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
+            self.sell(clear_price, clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
         
         elif self.expected_position < 0:
             clear_volume = min(-self.expected_position, self.max_allowed_buy_volume)
@@ -323,8 +322,8 @@ class LinearTrendTrader(ProductTrader):
         # STEP 3: Make orders
         # Since it is an upward trending product, we only make bids
         bid_price = self.compute_make_bid_price()
-        
-        if self.max_allowed_buy_volume > 0:
+
+        if bid_price is not None and self.max_allowed_buy_volume > 0:
             self.buy(bid_price, self.max_allowed_buy_volume)
         
         return {self.name : self.orders}
