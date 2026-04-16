@@ -53,7 +53,6 @@ class ProductTrader:
         self.clear_margin = self._get_clear_margin()
         self.make_margin = self._get_make_margin()
 
-        self.fair_value = self.compute_fair_value()
 
     def _get_last_traderData(self):
         if self.state.traderData and self.state.traderData != "":
@@ -169,12 +168,11 @@ class ProductTrader:
         best_ask_price = next(iter(self.quoted_sell_orders)) # take lowest sell price with active volume (>1)
         fair_ask_price = self.fair_value + self.make_margin
 
-        if best_ask_price < fair_ask_price:
-            pass # do nothing if best offer is lower than what we are willing to sell at
-        elif best_ask_price == fair_ask_price:
-            return fair_ask_price
-        else: # if best ask price is higher than fair ask price, we undercut it by 1 price tick
+        if best_ask_price > fair_ask_price:
+            # if ba > fair_ask, we undercut it by 1 price tick
             return best_ask_price - 1
+        else: 
+            return fair_ask_price
     
     def compute_make_bid_price(self):
         if not self.quoted_buy_orders:
@@ -183,11 +181,10 @@ class ProductTrader:
         fair_bid_price = self.fair_value - self.make_margin
 
         if best_bid_price < fair_bid_price:
+            # if bb < fair_bid, we overbid bb by 1 price tick
+            return best_bid_price + 1
+        else: 
             return fair_bid_price
-        elif best_bid_price == fair_bid_price:
-            return fair_bid_price
-        else: # if best bid price is higher than fair bid price, we undercut it by 1 price tick
-            return best_bid_price - 1
     
 # conflict with how super.__init()__ for ROOT is called before alpha and beta are defined
 # while compute_fair_value() requires alpha and beta
@@ -285,12 +282,12 @@ class LinearTrendTrader(ProductTrader):
             # first check if we should use a new day_offset
             if self.timestamp < self.last_traderData[self.name]["last_timestamp"]:
                 day_offset += 1 # increment day_offset by 1
-                # update day offset
-                self.new_traderData[self.name]["day_offset"] = day_offset
+                
             
             g_time_index = day_offset * 1_000_000 + self.timestamp
             fair = self.alpha + self.beta * g_time_index
-
+            # update day offset
+            self.new_traderData[self.name]["day_offset"] = day_offset
         return round(fair)
             
         
