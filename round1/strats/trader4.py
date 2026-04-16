@@ -291,6 +291,9 @@ class LinearTrendTrader(ProductTrader):
             
         
     def get_orders(self):
+        """
+        don't clear when position > 0. 
+        """
 
         # STEP 1: take orders first
         for bp, bv in self.quoted_buy_orders.items():
@@ -304,14 +307,9 @@ class LinearTrendTrader(ProductTrader):
             # lift offer
             self.buy(sp, sv)
         
-        # STEP 2: clear orders to have enough bullets for next iteration if +EV traders emerge
-        if self.expected_position > 0:
-            # if we sell too much, then orders will get cancelled
-            clear_volume = min(self.expected_position, self.max_allowed_sell_volume)
-            clear_price = self.fair_value + self.clear_margin # default is zero
-            self.sell(clear_price, clear_volume) # we are okay with going market neutral at the end of each iteration, if possible
+        # STEP 2: clear orders when expected pos is negative
         
-        elif self.expected_position < 0:
+        if self.expected_position < 0:
             clear_volume = min(-self.expected_position, self.max_allowed_buy_volume)
             clear_price = self.fair_value - self.clear_margin
             self.buy(clear_price, clear_volume)
