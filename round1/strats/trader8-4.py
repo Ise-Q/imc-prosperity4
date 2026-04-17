@@ -4,7 +4,13 @@ import jsonpickle
 import numpy as np
 
 
-# ASH: EMA(alpha = 0.05) fair value + take/clear/make | IPR: buy-and-hold
+# ASH_COATED_OSMIUM:
+#   EMA(alpha=0.05) fair value + take + make (no clear).
+#   Make-quoting upgrades vs trader8-3:
+#     (P1) inventory skew: shift both quotes by gamma * (pos / limit) toward flat
+#     (P2) dynamic make margin: scale with observed book spread,
+#          clipped to [make_margin (floor), make_margin_max (cap)]
+# INTARIAN_PEPPER_ROOT: unchanged — buy-and-hold linear-trend trader.
 
 PRODUCTS = ["INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM"]
 POS_LIMITS = {
@@ -15,7 +21,11 @@ PARAMS = {
     "ASH_COATED_OSMIUM": {
       "ema_alpha": 0.05,
       "take_margin": 1,
-      "clear_margin": 6, "make_margin": 2
+      "clear_margin": 6,
+      "make_margin": 3,           # floor (min) for dynamic margin
+      "make_margin_max": 6,       # cap for dynamic margin
+      "dyn_margin_k": 0.35,       # margin ~= round(k * (best_ask - best_bid)), clipped to [floor, cap]
+      "skew_gamma": 4,            # quote shift in ticks at full inventory (|pos|=limit)
     },
     "INTARIAN_PEPPER_ROOT":{
         "slope": 0.001, "intercept": 12000.0,
@@ -189,8 +199,19 @@ class ProductTrader:
 class EMATrader(ProductTrader):
     def __init__(self, state, new_traderData):
         super().__init__("ASH_COATED_OSMIUM", state, new_traderData)
-        self.ema_alpha = PARAMS[self.name]["ema_alpha"]
+        params = PARAMS[self.name]
+        self.ema_alpha = params["ema_alpha"]
         self.fair_value = self.compute_fair_value()
+
+        # --- P2: dynamic make margin scaled from book spread, clipped to [floor, cap] ---
+        self.make_margin_floor = params["make_margin"]
+        self.make_margin_cap   = params.get("make_margin_max", self.make_margin_floor)
+        self.dyn_margin_k      = params.get("dyn_margin_k", 0.0)
+        # overwrite self.make_margin (set by base to the static floor) with the dynamic value
+        self.make_margin = self._compute_dynamic_margin()
+
+        # --- P1: inventory-skew parameter ---
+        self.skew_gamma = params.get("skew_gamma", 0)
 
     def compute_fair_value(self):
         """
@@ -213,10 +234,64 @@ class EMATrader(ProductTrader):
         self.new_traderData[self.name]["ema"] = ema
         return round(ema)
 
+    def _compute_dynamic_margin(self):
+        """
+        Scale make margin with the observed book spread.
+        Wide book (~16 ticks) -> margin ~= 6; tight book -> margin floor.
+        Falls back to the floor if either side of the book is missing.
+        """
+        bb = self.get_best_bid()
+        ba = self.get_best_ask()
+        if bb is None or ba is None:
+            return self.make_margin_floor
+        spread = ba - bb
+        m = int(round(self.dyn_margin_k * spread))
+        if m < self.make_margin_floor:
+            return self.make_margin_floor
+        if m > self.make_margin_cap:
+            return self.make_margin_cap
+        return m
+
+    def _compute_skew(self):
+        """
+        Inventory skew in ticks.
+        Long  (pos > 0) -> positive skew -> shift both quotes DOWN
+                           (cheaper ask = sell easier; cheaper bid = buy harder).
+        Short (pos < 0) -> negative skew -> shift both quotes UP.
+        Uses expected_position so it already reflects any take-step fills this tick.
+        """
+        if self.position_limit == 0 or self.skew_gamma == 0:
+            return 0
+        return int(round(self.skew_gamma * self.expected_position / self.position_limit))
+
+    def compute_make_ask_price(self):
+        skew = self._compute_skew()
+        fair_ask_price = self.fair_value + self.make_margin - skew
+        if not self.quoted_sell_orders:
+            return fair_ask_price
+        best_ask_price = next(iter(self.quoted_sell_orders))
+        if best_ask_price > fair_ask_price:
+            # if ba > fair_ask, we undercut it by 1 price tick
+            return best_ask_price - 1
+        else:
+            return fair_ask_price
+
+    def compute_make_bid_price(self):
+        skew = self._compute_skew()
+        fair_bid_price = self.fair_value - self.make_margin - skew
+        if not self.quoted_buy_orders:
+            return fair_bid_price
+        best_bid_price = next(iter(self.quoted_buy_orders))
+        if best_bid_price < fair_bid_price:
+            # if bb < fair_bid, we overbid bb by 1 price tick
+            return best_bid_price + 1
+        else:
+            return fair_bid_price
+
     def get_orders(self):
         """
-        Same take-clear-make pipeline as StaticTrader in trader6,
-        but using EMA-based fair value.
+        Take and Make (no clear).
+        Make quotes are inventory-skewed and use a dynamic (spread-scaled) margin.
         """
         # STEP 1: take mispriced orders first
         for bp, bv in self.quoted_buy_orders.items():
@@ -230,11 +305,10 @@ class EMATrader(ProductTrader):
             # lift offer
             self.buy(sp, sv)
 
-        # STEP 2: Make orders
+        # STEP 2: Make orders (skew + dynamic margin applied inside compute_make_*_price)
         ask_price = self.compute_make_ask_price()
-        bid_price = self.compute_make_bid_price()   
+        bid_price = self.compute_make_bid_price()
 
-        # default: don't care about inventory as of now, change later
         if ask_price is not None and self.max_allowed_sell_volume > 0:
             self.sell(ask_price, self.max_allowed_sell_volume)
         if bid_price is not None and self.max_allowed_buy_volume > 0:
@@ -288,22 +362,12 @@ class LinearTrendTrader(ProductTrader):
 
     def get_orders(self):
         """
-        don't clear when position > 0.
+        buy-hold
         """
 
         # buy at aggressive prices
         agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
         self.buy(agg_sp, self.position_limit)
-
-        # STEP 2: clear orders when expected pos is negative
-
-
-
-        # STEP 3: Make orders
-        # Since it is an upward trending product, we only make bids
-#        bid_price = self.compute_make_bid_price()
-
- ##          self.buy(bid_price, self.max_allowed_buy_volume)
 
 
         return {self.name : self.orders}
@@ -335,5 +399,3 @@ class Trader:
         traderData = jsonpickle.encode(new_traderData)
         conversions = 0
         return result, conversions, traderData
-
-
