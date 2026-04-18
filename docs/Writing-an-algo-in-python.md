@@ -320,7 +320,7 @@ traderData = ""
 state = TradingState(
 	traderData,
 	timestamp,
-  listings,
+    listings,
 	order_depths,
 	own_trades,
 	market_trades,
@@ -424,7 +424,7 @@ traderData = ""
 state = TradingState(
 	traderData,
 	timestamp,
-  listings,
+    listings,
 	order_depths,
 	own_trades,
 	market_trades,

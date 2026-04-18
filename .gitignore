@@ -2,3 +2,5 @@
 *.Identifier
 CLAUDE.md
 .claude
+repos/
+round1/notebooks/output/
