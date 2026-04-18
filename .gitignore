@@ -4,3 +4,4 @@ CLAUDE.md
 .claude
 repos/
 round1/notebooks/output/
+__pycache__/
