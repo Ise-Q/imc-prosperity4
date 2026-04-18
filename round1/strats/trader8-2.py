@@ -292,19 +292,9 @@ class LinearTrendTrader(ProductTrader):
         """
 
         # buy at aggressive prices
-        agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
-        self.buy(agg_sp, self.position_limit)
-
-        # STEP 2: clear orders when expected pos is negative
-
-
-
-        # STEP 3: Make orders
-        # Since it is an upward trending product, we only make bids
-#        bid_price = self.compute_make_bid_price()
-
- ##          self.buy(bid_price, self.max_allowed_buy_volume)
-
+        if self.quoted_sell_orders:
+            agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
+            self.buy(agg_sp, self.position_limit)
 
         return {self.name : self.orders}
 
