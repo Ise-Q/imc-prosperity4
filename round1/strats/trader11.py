@@ -259,8 +259,9 @@ class LinearTrendTrader(ProductTrader):
 
     def get_orders(self):
         # buy at aggressive prices
-        agg_sp = list(self.quoted_sell_orders.keys())[-1]
-        self.buy(agg_sp, self.position_limit)
+        if self.quoted_sell_orders:
+            agg_sp = list(self.quoted_sell_orders.keys())[-1]
+            self.buy(agg_sp, self.position_limit)
 
         return {self.name : self.orders}
 

@@ -366,8 +366,9 @@ class LinearTrendTrader(ProductTrader):
         """
 
         # buy at aggressive prices
-        agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
-        self.buy(agg_sp, self.position_limit)
+        if self.quoted_sell_orders:
+            agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
+            self.buy(agg_sp, self.position_limit)
 
 
         return {self.name : self.orders}
