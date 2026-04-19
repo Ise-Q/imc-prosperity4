@@ -84,17 +84,18 @@ the folder you want to inspect.
 ## Interactive visualizer (`viz.py`)
 
 Launch a Dash app in the browser to inspect any run — either a local
-backtester run or a Prosperity website submission.
+backtester run or a Prosperity website submission. Accepts either a log
+directory or a single `.log` / `.json` file.
 
 ```sh
-# Local backtester run
-uv run python tools/viz.py round1/logs/local-20260418-203355
+# Local backtester run (directory — timestamp will vary per run)
+uv run python tools/viz.py round1/logs/local-<timestamp>
 
-# Website submission run
-uv run python tools/viz.py round1/logs/263711
+# Website submission run (directory — <submission-id> is the numeric run id)
+uv run python tools/viz.py round1/logs/<submission-id>
 
-# Single file also works
-uv run python tools/viz.py round1/logs/local-20260418-203355/backtest.log
+# Single file also works (useful if you only kept the .log)
+uv run python tools/viz.py round1/logs/local-<timestamp>/backtest.log
 ```
 
 Flags: `--port 8050`, `--host 127.0.0.1`, `--no-open` (skip auto-open), `--debug`.
