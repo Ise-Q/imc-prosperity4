@@ -61,7 +61,31 @@ DAY_TIMESTAMP_SPAN = 1_000_000
 POSITION_LIMITS: dict[int, dict[str, int]] = {
     0: {"EMERALDS": 80, "TOMATOES": 80},
     1: {"ASH_COATED_OSMIUM": 80, "INTARIAN_PEPPER_ROOT": 80},
+    2: {"ASH_COATED_OSMIUM": 80, "INTARIAN_PEPPER_ROOT": 80},
 }
+
+
+class RepoRoundReader(FileReader):
+    """Resolve data files against `<repo>/round{N}/data/` with package fallback.
+
+    The PyPI `prosperity4btest` bundles CSVs only up through round 1, but the
+    repo keeps each round's raw CSVs in `round{N}/data/`. The package's data
+    loader asks for path parts `[f"round{N}", "prices_round_{N}_day_{D}.csv"]`;
+    we reshape that into `<repo>/round{N}/data/<filename>`. If the local file
+    isn't there, fall through to `PackageResourcesReader` so round 0/1 still
+    work off the bundled data.
+    """
+
+    def __init__(self, repo_root: Path) -> None:
+        self._repo_root = repo_root
+        self._fallback = PackageResourcesReader()
+
+    def file(self, path_parts: list[str]):
+        if len(path_parts) == 2 and path_parts[0].startswith("round"):
+            local = self._repo_root / path_parts[0] / "data" / path_parts[1]
+            if local.is_file():
+                return wrap_in_context_manager(local)
+        return self._fallback.file(path_parts)
 
 
 def _rebase_day_data(data, offset: int) -> None:
@@ -409,7 +433,7 @@ def main() -> int:
     if args.data is not None:
         file_reader = FileSystemReader(args.data)
     else:
-        file_reader = PackageResourcesReader()
+        file_reader = RepoRoundReader(REPO_ROOT)
 
     print(f"[run_backtest] trader : {trader}")
     print(f"[run_backtest] days   : {day_strs}")
