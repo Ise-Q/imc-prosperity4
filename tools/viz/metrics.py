@@ -51,6 +51,17 @@ def enrich_activities(activities: pd.DataFrame) -> pd.DataFrame:
     df["ob_vwap"] = _compute_ob_vwap(df)
     df["wall_mid"] = _compute_wall_mid(df)
 
+    if "profit_and_loss" in df.columns:
+        # The Rust backtester emits PnL using mid_price=0.0 on fully-empty-OB
+        # rows, which yields large spurious swings. Blank those out and
+        # forward-fill within (product, day) so the PnL line stays continuous
+        # through empty-OB ticks.
+        df.loc[df["ob_empty"], "profit_and_loss"] = np.nan
+        df["profit_and_loss"] = (
+            df.groupby(["product", "day"])["profit_and_loss"]
+              .transform(lambda s: s.ffill())
+        )
+
     return df
 
 
@@ -108,26 +119,30 @@ def _compute_wall_mid(df: pd.DataFrame) -> pd.Series:
 
 
 def position_timeline(trades_for_product: pd.DataFrame) -> pd.DataFrame:
-    """Cumulative signed position over time, reset at each day boundary."""
+    """Cumulative signed position over time, continuous across days."""
     if trades_for_product.empty:
         return pd.DataFrame({"global_ts": [0], "position": [0], "day": [0]})
 
     t = trades_for_product.sort_values(["day", "global_ts"]).copy()
-    t["position"] = t.groupby("day")["signed_qty"].cumsum()
+    t["position"] = t["signed_qty"].cumsum()
 
-    pieces = []
-    for day, grp in t.groupby("day", sort=True):
-        baseline_ts = grp["global_ts"].iloc[0] - 1
-        pieces.append(pd.DataFrame({"global_ts": [baseline_ts], "position": [0], "day": [day]}))
-        pieces.append(grp[["global_ts", "position", "day"]])
-    return pd.concat(pieces, ignore_index=True)
+    first = t.iloc[0]
+    baseline = pd.DataFrame({
+        "global_ts": [int(first["global_ts"]) - 1],
+        "position": [0],
+        "day": [int(first["day"])],
+    })
+    return pd.concat(
+        [baseline, t[["global_ts", "position", "day"]]],
+        ignore_index=True,
+    )
 
 
 def align_position_to_activities(
     activities_for_product: pd.DataFrame,
     trades_for_product: pd.DataFrame,
 ) -> pd.Series:
-    """Return position at each activities row; resets per day."""
+    """Return position at each activities row; continuous across days."""
     if activities_for_product.empty:
         return pd.Series(dtype=float)
 
@@ -135,24 +150,19 @@ def align_position_to_activities(
         return pd.Series(0, index=activities_for_product.index)
 
     t = trades_for_product.sort_values(["day", "global_ts"]).copy()
-    t["position"] = t.groupby("day")["signed_qty"].cumsum()
+    t["position"] = t["signed_qty"].cumsum()
 
-    out = pd.Series(0, index=activities_for_product.index, dtype=int)
-    for day, acts_day in activities_for_product.groupby("day", sort=False):
-        trades_day = t[t["day"] == day]
-        if trades_day.empty:
-            continue
-        lookup = trades_day[["global_ts", "position"]].drop_duplicates("global_ts", keep="last")
-        merged = pd.merge_asof(
-            acts_day[["global_ts"]].sort_values("global_ts"),
-            lookup.sort_values("global_ts"),
-            on="global_ts",
-            direction="backward",
-        )
-        merged["position"] = merged["position"].fillna(0).astype(int)
-        merged.index = acts_day.sort_values("global_ts").index
-        out.loc[acts_day.index] = merged["position"].reindex(acts_day.index).to_numpy()
-    return out
+    acts_sorted = activities_for_product.sort_values("global_ts")
+    lookup = t[["global_ts", "position"]].drop_duplicates("global_ts", keep="last")
+    merged = pd.merge_asof(
+        acts_sorted[["global_ts"]],
+        lookup.sort_values("global_ts"),
+        on="global_ts",
+        direction="backward",
+    )
+    merged["position"] = merged["position"].fillna(0).astype(int)
+    merged.index = acts_sorted.index
+    return merged["position"].reindex(activities_for_product.index)
 
 
 def edge_stats(trades_for_product: pd.DataFrame, fair_value: float) -> dict:

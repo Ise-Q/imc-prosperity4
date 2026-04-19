@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, Patch, State, dcc, html
+from dash.exceptions import PreventUpdate
 from plotly.subplots import make_subplots
 
 from tools.viz.metrics import (
@@ -199,6 +200,94 @@ def build_app(log: LoadedLog) -> Dash:
             depth_sel,
         )
 
+    @app.callback(
+        Output("main-graph", "figure", allow_duplicate=True),
+        Input("main-graph", "relayoutData"),
+        State("layout-mode", "value"),
+        State("product-dropdown", "value"),
+        State("day-filter", "value"),
+        State("overlay-toggles", "value"),
+        State("trade-toggles", "value"),
+        State("depth-toggles", "value"),
+        prevent_initial_call=True,
+    )
+    def _autoscale_y(relayout, layout_mode, product, days, overlays, trade_layers, depth_levels):
+        kind = _classify_relayout(relayout or {})
+        if kind is None:
+            raise PreventUpdate
+
+        if layout_mode == "stacked":
+            products_to_render = pre.products
+        else:
+            products_to_render = [product] if product else []
+        if not products_to_render:
+            raise PreventUpdate
+
+        patch = Patch()
+
+        if kind == "reset":
+            for idx in range(len(products_to_render)):
+                base = 4 * idx
+                for r in range(1, 5):
+                    patch["layout"][_yaxis_key(base + r)]["autorange"] = True
+            return patch
+
+        xr = _extract_x_range(relayout)
+        if xr is None:
+            raise PreventUpdate
+        x_lo, x_hi = xr
+
+        days_sel = set(days or [])
+        overlays_sel = set(overlays or [])
+        trade_sel = set(trade_layers or [])
+        depth_sel = set(depth_levels or [])
+
+        wrote_anything = False
+        for idx, p in enumerate(products_to_render):
+            base = 4 * idx
+
+            acts = pre.activities_by_product.get(p, pd.DataFrame())
+            trades = pre.trades_by_product.get(p, pd.DataFrame())
+            pos_tl = pre.position_timeline_by_product.get(p, pd.DataFrame())
+
+            if not acts.empty:
+                acts_f = acts[acts["day"].isin(days_sel)] if days_sel else acts.iloc[0:0]
+            else:
+                acts_f = acts
+            if not trades.empty:
+                trades_f = trades[trades["day"].isin(days_sel)] if days_sel else trades.iloc[0:0]
+            else:
+                trades_f = trades
+
+            if not acts_f.empty:
+                acts_f = acts_f[(acts_f["global_ts"] >= x_lo) & (acts_f["global_ts"] <= x_hi)]
+            if not trades_f.empty:
+                trades_f = trades_f[(trades_f["global_ts"] >= x_lo) & (trades_f["global_ts"] <= x_hi)]
+            if not pos_tl.empty:
+                pos_tl_f = pos_tl[(pos_tl["global_ts"] >= x_lo) & (pos_tl["global_ts"] <= x_hi)]
+            else:
+                pos_tl_f = pos_tl
+
+            panels = (
+                (1, _price_y_range(acts_f, trades_f, overlays_sel, depth_sel, trade_sel)),
+                (2, _spread_y_range(acts_f)),
+                (3, _position_y_range(pos_tl_f)),
+                (4, _pnl_y_range(acts_f)),
+            )
+            for row, rng in panels:
+                if rng is None:
+                    continue
+                lo, hi = _pad_range(*rng)
+                key = _yaxis_key(base + row)
+                patch["layout"][key]["range"] = [lo, hi]
+                patch["layout"][key]["autorange"] = False
+                wrote_anything = True
+
+        if not wrote_anything:
+            raise PreventUpdate
+
+        return patch
+
     return app
 
 
@@ -333,31 +422,78 @@ def _add_depth_lines(fig: go.Figure, acts: pd.DataFrame, row: int, levels: set[i
         alpha = style["alpha"]
         width = style["width"]
         bid_price = acts[f"bid_price_{level}"]
+        bid_vol = acts[f"bid_volume_{level}"]
         ask_price = acts[f"ask_price_{level}"]
-        fig.add_trace(
-            go.Scatter(
-                x=x, y=bid_price,
-                name=f"bid L{level}",
-                mode="lines",
-                line=dict(color=f"rgba({BID_COLOR},{alpha})", width=width),
-                connectgaps=False,
-                legendgroup=f"bid_L{level}",
-                hovertemplate=f"L{level} bid px: " "%{y:.1f}<extra></extra>",
-            ),
-            row=row, col=1,
+        ask_vol = acts[f"ask_volume_{level}"]
+
+        _add_depth_side(
+            fig, x, bid_price, bid_vol, row,
+            name=f"bid L{level}", level=level, side="bid",
+            color=f"rgba({BID_COLOR},{alpha})", width=width,
+            legendgroup=f"bid_L{level}",
         )
-        fig.add_trace(
-            go.Scatter(
-                x=x, y=ask_price,
-                name=f"ask L{level}",
-                mode="lines",
-                line=dict(color=f"rgba({ASK_COLOR},{alpha})", width=width),
-                connectgaps=False,
-                legendgroup=f"ask_L{level}",
-                hovertemplate=f"L{level} ask px: " "%{y:.1f}<extra></extra>",
-            ),
-            row=row, col=1,
+        _add_depth_side(
+            fig, x, ask_price, ask_vol, row,
+            name=f"ask L{level}", level=level, side="ask",
+            color=f"rgba({ASK_COLOR},{alpha})", width=width,
+            legendgroup=f"ask_L{level}",
         )
+
+
+def _add_depth_side(
+    fig: go.Figure,
+    x: pd.Series,
+    price: pd.Series,
+    qty: pd.Series,
+    row: int,
+    *,
+    name: str,
+    level: int,
+    side: str,
+    color: str,
+    width: float,
+    legendgroup: str,
+) -> None:
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=price,
+            name=name,
+            mode="lines",
+            line=dict(color=color, width=width),
+            connectgaps=False,
+            legendgroup=legendgroup,
+            hoverinfo="skip",
+        ),
+        row=row, col=1,
+    )
+
+    hover_y = price.ffill().bfill()
+    if hover_y.isna().all():
+        return
+
+    customdata = _price_qty_customdata(price, qty)
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=hover_y,
+            name=name,
+            mode="markers",
+            marker=dict(size=1, opacity=0, color=color),
+            customdata=customdata,
+            legendgroup=legendgroup,
+            showlegend=False,
+            hovertemplate=(
+                f"L{level} {side} px: %{{customdata[0]}} / qty: %{{customdata[1]}}"
+                "<extra></extra>"
+            ),
+        ),
+        row=row, col=1,
+    )
+
+
+def _price_qty_customdata(price: pd.Series, qty: pd.Series) -> np.ndarray:
+    px_str = np.where(price.isna(), "N/A", price.map(lambda v: f"{v:.1f}" if pd.notna(v) else "N/A"))
+    qty_str = np.where(qty.isna(), "N/A", qty.map(lambda v: f"{int(v)}" if pd.notna(v) else "N/A"))
+    return np.column_stack([px_str, qty_str])
 
 
 def _add_spread(fig: go.Figure, acts: pd.DataFrame, row: int) -> None:
@@ -554,3 +690,140 @@ def _add_day_dividers(fig: go.Figure, pre: Precomputed, days: set[int], total_ro
             line=dict(color="#bbbbbb", width=0.8, dash="dot"),
             row="all", col=1,
         )
+
+
+def _yaxis_key(n: int) -> str:
+    return "yaxis" if n == 1 else f"yaxis{n}"
+
+
+def _classify_relayout(relayout: dict) -> str | None:
+    """Return 'zoom' / 'reset' / None.
+
+    - 'zoom': x-axis range changed; no explicit user y-range set in the same event.
+    - 'reset': x-axis autorange was toggled on (e.g. double-click).
+    - None: event is irrelevant (hover spikes, y-only echoes of our own patch, etc.).
+    """
+    if not relayout:
+        return None
+
+    has_x_range = False
+    has_x_reset = False
+    has_y_range = False
+
+    for k, v in relayout.items():
+        if k.startswith("xaxis"):
+            if k.endswith(".autorange") and v:
+                has_x_reset = True
+            elif ".range" in k:
+                has_x_range = True
+        elif k.startswith("yaxis"):
+            if ".range" in k and not k.endswith(".autorange"):
+                has_y_range = True
+
+    if has_y_range:
+        return None
+    if has_x_reset:
+        return "reset"
+    if has_x_range:
+        return "zoom"
+    return None
+
+
+def _extract_x_range(relayout: dict) -> tuple[float, float] | None:
+    """Pull (lo, hi) from relayoutData regardless of which key form Plotly used."""
+    if not relayout:
+        return None
+
+    for k, v in relayout.items():
+        if k.startswith("xaxis") and k.endswith(".range") and isinstance(v, list) and len(v) == 2:
+            try:
+                return float(v[0]), float(v[1])
+            except (TypeError, ValueError):
+                return None
+
+    lo = hi = None
+    for k, v in relayout.items():
+        if not k.startswith("xaxis"):
+            continue
+        if k.endswith(".range[0]"):
+            lo = v
+        elif k.endswith(".range[1]"):
+            hi = v
+    if lo is None or hi is None:
+        return None
+    try:
+        return float(lo), float(hi)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pad_range(lo: float, hi: float, pad: float = 0.05) -> tuple[float, float]:
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return lo, hi
+    if hi == lo:
+        delta = max(abs(lo) * 0.05, 0.5)
+        return lo - delta, hi + delta
+    span = hi - lo
+    return lo - span * pad, hi + span * pad
+
+
+def _price_y_range(
+    acts_f: pd.DataFrame,
+    trades_f: pd.DataFrame,
+    overlays: set[str],
+    depth_levels: set[int],
+    trade_layers: set[str],
+) -> tuple[float, float] | None:
+    pieces: list[pd.Series] = []
+    if not acts_f.empty:
+        for level in depth_levels:
+            for side in ("bid", "ask"):
+                col = f"{side}_price_{level}"
+                if col in acts_f.columns:
+                    pieces.append(acts_f[col])
+        for name in ("mid", "ob_vwap", "wall_mid"):
+            if name in overlays and name in acts_f.columns:
+                pieces.append(acts_f[name])
+    if not trades_f.empty and "price" in trades_f.columns:
+        is_own = trades_f["is_own"].astype(bool) if "is_own" in trades_f.columns else pd.Series(False, index=trades_f.index)
+        mask = pd.Series(False, index=trades_f.index)
+        if "own" in trade_layers:
+            mask = mask | is_own
+        if "market" in trade_layers:
+            mask = mask | ~is_own
+        if mask.any():
+            pieces.append(trades_f.loc[mask, "price"])
+
+    if not pieces:
+        return None
+    combined = pd.concat(pieces, ignore_index=True).dropna()
+    if combined.empty:
+        return None
+    return float(combined.min()), float(combined.max())
+
+
+def _spread_y_range(acts_f: pd.DataFrame) -> tuple[float, float] | None:
+    if acts_f.empty or "spread" not in acts_f.columns:
+        return None
+    s = acts_f["spread"].dropna()
+    if s.empty:
+        return None
+    return float(s.min()), float(s.max())
+
+
+def _position_y_range(pos_tl_f: pd.DataFrame) -> tuple[float, float] | None:
+    if pos_tl_f.empty or "position" not in pos_tl_f.columns:
+        return None
+    s = pos_tl_f["position"].dropna()
+    if s.empty:
+        return None
+    return float(s.min()), float(s.max())
+
+
+def _pnl_y_range(acts_f: pd.DataFrame) -> tuple[float, float] | None:
+    if acts_f.empty or "profit_and_loss" not in acts_f.columns:
+        return None
+    s = acts_f["profit_and_loss"].dropna()
+    if s.empty:
+        return None
+    return float(s.min()), float(s.max())
