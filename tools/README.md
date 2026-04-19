@@ -54,6 +54,44 @@ run-id folders downloaded from the Prosperity website. The
 `analyze_results.ipynb` notebook accepts either — just point `LOG_DIR` at
 the folder you want to inspect.
 
+## Interactive visualizer (`viz.py`)
+
+Launch a Dash app in the browser to inspect any run — either the Rust local
+backtester output or a Prosperity website submission.
+
+```sh
+# Local backtester run
+uv run python tools/viz.py round1/logs/local-20260418-203355
+
+# Website submission run
+uv run python tools/viz.py round1/logs/263711
+
+# Single file also works
+uv run python tools/viz.py round1/logs/local-20260418-203355/backtest.log
+```
+
+Flags: `--port 8050`, `--host 127.0.0.1`, `--no-open` (skip auto-open), `--debug`.
+
+Per product the UI shows four stacked panels with a shared x-axis: price +
+trades, spread, position (±limit bands, resets per day), PnL. Toggles along
+the top:
+
+- Layout: `single` (product dropdown) or `stacked` (all products).
+- Days: checkbox filter for multi-day runs.
+- Overlays: `mid`, `ob_vwap` (orderbook VWAP across all 3 levels),
+  `wall_mid` (cross-weighted max-volume-level price), `empty_ob` (grey
+  dotted verticals at ticks where *both* sides of the orderbook are fully
+  empty — no bid or ask price at any level).
+- Trade layers: `own` (triangles, green BUY / red SELL, size ∝ qty) vs
+  `market` (grey x). Hover shows price, quantity, side.
+- Depth levels: toggle L1/L2/L3 independently. One line per level per
+  side; vivid at L1 and fading at L3.
+
+Mid, spread, and the overlays use **best bid / best ask** (first non-NaN
+price across L1→L3), not hardcoded L1. If one side is fully empty, mid
+falls back to the other side's best; only when both sides are fully empty
+does mid become NaN (and `empty_ob` marks those ticks).
+
 ## Upgrading the backtester
 
 ```sh
