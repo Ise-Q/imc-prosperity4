@@ -33,7 +33,12 @@ from prosperity4bt.__main__ import (
 )
 from prosperity4bt.data import read_day_data
 from prosperity4bt.datamodel import Observation, Trade, TradingState
-from prosperity4bt.file_reader import FileReader, FileSystemReader, PackageResourcesReader
+from prosperity4bt.file_reader import (
+    FileReader,
+    FileSystemReader,
+    PackageResourcesReader,
+    wrap_in_context_manager,
+)
 from prosperity4bt.models import BacktestResult, SandboxLogRow, TradeMatchingMode
 from prosperity4bt.runner import (
     create_activity_logs,
@@ -228,6 +233,111 @@ def run_continuous(
     return merged
 
 
+def compute_summary_metrics(merged: BacktestResult) -> dict:
+    """Derive per-product and total scoreboard metrics from a merged result.
+
+    Activity row columns layout (prosperity4bt): index 1=timestamp, 2=product,
+    15=mid_price, 16=profit_and_loss. Trade rows expose .trade.{symbol,price,
+    quantity,buyer,seller,timestamp}.
+    """
+    acts_by_product: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+    for row in merged.activity_logs:
+        c = row.columns
+        acts_by_product[c[2]].append((c[1], c[15], c[16]))
+    for p in acts_by_product:
+        acts_by_product[p].sort(key=lambda x: x[0])
+
+    own_by_product: dict[str, list[tuple[int, int, float, str]]] = defaultdict(list)
+    missed_by_product: dict[str, int] = defaultdict(int)
+    for tr in merged.trades:
+        t = tr.trade
+        if t.buyer == "SUBMISSION":
+            own_by_product[t.symbol].append((t.timestamp, t.quantity, t.price, "BUY"))
+        elif t.seller == "SUBMISSION":
+            own_by_product[t.symbol].append((t.timestamp, -t.quantity, t.price, "SELL"))
+        else:
+            missed_by_product[t.symbol] += 1
+    for p in own_by_product:
+        own_by_product[p].sort(key=lambda x: x[0])
+
+    final_ts = max((r.columns[1] for r in merged.activity_logs), default=0)
+
+    per_product: dict[str, dict] = {}
+    total_pnl = 0.0
+    for product, acts in acts_by_product.items():
+        own = own_by_product.get(product, [])
+
+        final_pnl = acts[-1][2] if acts else 0.0
+        total_pnl += final_pnl
+
+        buys = [x for x in own if x[3] == "BUY"]
+        sells = [x for x in own if x[3] == "SELL"]
+        taken = len(own)
+        missed = missed_by_product.get(product, 0)
+        total_book = taken + missed
+        participation = (taken / total_book * 100.0) if total_book else 0.0
+
+        # Mid==0 appears on fully-empty-orderbook ticks; exclude from the avg
+        # so the edge figures stay meaningful.
+        valid_mids = [m for _, m, _ in acts if m and m > 0]
+        avg_mid = sum(valid_mids) / len(valid_mids) if valid_mids else None
+
+        avg_buy_px = sum(x[2] for x in buys) / len(buys) if buys else None
+        avg_sell_px = sum(x[2] for x in sells) / len(sells) if sells else None
+        avg_buy_edge = (avg_mid - avg_buy_px) if (avg_mid is not None and avg_buy_px is not None) else None
+        avg_sell_edge = (avg_sell_px - avg_mid) if (avg_mid is not None and avg_sell_px is not None) else None
+
+        positions: list[int] = []
+        pos = 0
+        j = 0
+        for ts, _, _ in acts:
+            while j < len(own) and own[j][0] <= ts:
+                pos += own[j][1]
+                j += 1
+            positions.append(pos)
+        avg_pos = sum(positions) / len(positions) if positions else 0.0
+        final_pos = positions[-1] if positions else 0
+
+        per_product[product] = {
+            "final_pnl": final_pnl,
+            "trades_taken": taken,
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "trades_missed": missed,
+            "participation_pct": participation,
+            "avg_mid": avg_mid,
+            "avg_buy_edge": avg_buy_edge,
+            "avg_sell_edge": avg_sell_edge,
+            "avg_pos": avg_pos,
+            "final_pos": final_pos,
+        }
+
+    return {
+        "final_timestamp": final_ts,
+        "total_pnl": total_pnl,
+        "per_product": per_product,
+    }
+
+
+def format_summary(metrics: dict) -> str:
+    lines = ["[run_backtest] summary:",
+             f"  final timestamp : {metrics['final_timestamp']}",
+             f"  total PnL       : {metrics['total_pnl']:+.1f}"]
+    for product, m in sorted(metrics["per_product"].items()):
+        buy_edge = f"{m['avg_buy_edge']:+.2f}" if m["avg_buy_edge"] is not None else "n/a"
+        sell_edge = f"{m['avg_sell_edge']:+.2f}" if m["avg_sell_edge"] is not None else "n/a"
+        lines.extend([
+            "",
+            f"  {product}",
+            f"    PnL              {m['final_pnl']:+.1f}",
+            f"    trades taken     {m['trades_taken']} (buy {m['buy_count']} / sell {m['sell_count']})"
+            f"   missed {m['trades_missed']}   participation {m['participation_pct']:.1f}%",
+            f"    avg buy edge     {buy_edge}   avg sell edge {sell_edge}",
+            f"    avg pos          {m['avg_pos']:+.2f}   final pos {m['final_pos']:+d}",
+        ])
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Run a continuous multi-day backtest (state carries across days by default).",
@@ -312,7 +422,7 @@ def main() -> int:
 
     match_mode = TradeMatchingMode(args.match_trades)
 
-    run_continuous(
+    merged = run_continuous(
         algorithm_path=trader,
         day_strs=day_strs,
         out_path=out_path,
@@ -323,6 +433,11 @@ def main() -> int:
         print_output=args.print_output,
         show_progress=not args.no_progress,
     )
+
+    metrics = compute_summary_metrics(merged)
+    summary_text = format_summary(metrics)
+    print(summary_text)
+    (log_dir / "summary.txt").write_text(summary_text + "\n")
 
     print(f"[run_backtest] wrote  : {out_path}")
     return 0
