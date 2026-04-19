@@ -159,34 +159,56 @@ class BackTester:
 
     def _write_log(self, result: BacktestResult, out_path: str) -> None:
         """
-        Write the output log file in Prosperity visualizer format.
-
-        Format:
-          Activity log header
-          Activity log rows (all days)
-          <blank line>
-          Sandbox log JSON objects (one per timestamp)
+        Write output log in Prosperity visualizer JSON format:
+        {
+            "submissionId": "local",
+            "activitiesLog": "day;timestamp;...\n...",
+            "logs": "sandbox log lines",
+            "tradeHistory": [...]
+        }
         """
         activity_header = self._log_creator.create_header()
         activity_rows: List[str] = [activity_header]
-        sandbox_logs: List[str]  = []
+        sandbox_lines: List[str] = []
+        trade_history: List[dict] = []
 
         for day_result in result.day_results:
             for ts_result in day_result.timestamp_results:
-                # Activity rows
                 if ts_result.activity_log:
                     activity_rows.append(ts_result.activity_log)
 
-                # Sandbox log — one JSON object per timestamp
-                sandbox_entry = json.dumps({
+                sandbox_lines.append(json.dumps({
                     "sandboxLog": "",
                     "lambdaLog" : ts_result.lambda_log.rstrip("\n"),
                     "timestamp" : ts_result.timestamp,
-                }, separators=(",", ":"))
-                sandbox_logs.append(sandbox_entry)
+                }, separators=(",", ":")))
+
+                for product, trades in ts_result.own_trades.items():
+                    for trade in trades:
+                        trade_history.append({
+                            "timestamp" : ts_result.timestamp,
+                            "buyer"     : trade.buyer,
+                            "seller"    : trade.seller,
+                            "symbol"    : trade.symbol,
+                            "currency"  : "XIREC",
+                            "price"     : trade.price,
+                            "quantity"  : trade.quantity,
+                        })
+
+        seen = set()
+        deduped_trades = []
+        for t in trade_history:
+            key = (t["symbol"], t["timestamp"], t["price"], t["quantity"], t["buyer"], t["seller"])
+            if key not in seen:
+                seen.add(key)
+                deduped_trades.append(t)
+
+        output = {
+            "submissionId" : "local",
+            "activitiesLog": "\n".join(activity_rows) + "\n",
+            "logs"         : "\n".join(sandbox_lines) + "\n",
+            "tradeHistory" : deduped_trades,
+        }
 
         with open(out_path, "w") as f:
-            f.write("\n".join(activity_rows))
-            f.write("\n\n")
-            f.write("\n".join(sandbox_logs))
-            f.write("\n")
+            json.dump(output, f)

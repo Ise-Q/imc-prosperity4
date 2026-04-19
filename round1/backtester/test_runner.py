@@ -29,10 +29,10 @@ from datamodel import OrderDepth, TradingState, Trade, Listing, Observation
 
 
 POSITION_LIMITS: Dict[str, int] = {
-    "ASH_COATED_OSMIUM": 20,
-    "INTARIAN_PEPPER_ROOT": 20,
+    "ASH_COATED_OSMIUM": 80,
+    "INTARIAN_PEPPER_ROOT": 80,
 }
-DEFAULT_LIMIT = 20
+DEFAULT_LIMIT = 80
 
 
 class TestRunner:
@@ -70,6 +70,7 @@ class TestRunner:
         trader_data = initial_trader_data
         positions: Dict[str, int] = dict(initial_positions or {})
         cash: Dict[str, float]    = dict(initial_cash or {})
+        last_pnl: Dict[str, float] = {}
 
         # Track own_trades per product (fills since last tick — reset each ts)
         own_trades: Dict[str, list] = defaultdict(list)
@@ -157,7 +158,7 @@ class TestRunner:
                         Trade(
                             symbol   = product,
                             price    = fill.price,
-                            quantity = fill.quantity,
+                            quantity = abs(fill.quantity),
                             buyer    = "SUBMISSION" if fill.quantity > 0 else "",
                             seller   = "" if fill.quantity > 0 else "SUBMISSION",
                             timestamp= ts,
@@ -171,8 +172,12 @@ class TestRunner:
             for product, pr in price_rows.items():
                 pos     = positions.get(product, 0)
                 c       = cash.get(product, 0.0)
-                mtm_pnl = c + pos * pr.mid_price
+                if pr.mid_price and pr.mid_price > 0:
+                    mtm_pnl = c + pos * pr.mid_price
+                else:
+                    mtm_pnl = last_pnl.get(product, 0.0)
                 pnl_this_ts[product] = mtm_pnl
+                last_pnl[product] = mtm_pnl
                 activity_lines.append(
                     self._log_creator.create_row(pr, mtm_pnl)
                 )

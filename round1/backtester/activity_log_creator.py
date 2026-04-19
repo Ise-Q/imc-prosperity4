@@ -5,7 +5,7 @@ Produces activity log lines in the format expected by the Prosperity platform
 and compatible with jmerle's visualizer.
 
 Activity log format (semicolon-separated):
-  day;timestamp;product;bid_price_1;bid_volume_1;...;ask_price_1;ask_volume_1;...;mid_price;pnl
+  day;timestamp;product;bid_price_1;bid_volume_1;...;mid_price;pnl
 """
 from typing import Dict, List, Optional
 from .models.input import PriceRow

@@ -1,10 +1,14 @@
 """
 OrderMatchMaker
 ===============
-Simulates exchange order matching:
-  1. Hit order book (order depths) first
-  2. Fall back to market trades if book volume insufficient
-Position limits are enforced — orders that would exceed the limit are cancelled.
+Simulates Prosperity exchange order matching.
+
+Key rules:
+  1. Aggressive orders (buy >= best_ask, sell <= best_bid) fill immediately.
+  2. Passive orders do not fill this tick.
+  3. Position limits: if net filled position would exceed ±limit, the entire
+     product's orders are cancelled (Prosperity all-or-nothing behaviour).
+  4. Fills happen at the book price, not the order price.
 """
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
@@ -18,26 +22,19 @@ class Fill:
 
 
 class OrderMatchMaker:
+    VERSION = "v2_simulation"
 
     def match(
         self,
-        orders_by_product: Dict[str, list],   # product -> [Order]
-        order_depths: Dict[str, object],       # product -> OrderDepth
-        market_trade_rows: list,               # [TradeRow]
+        orders_by_product: Dict[str, list],
+        order_depths: Dict[str, object],
+        market_trade_rows: list,
         positions: Dict[str, int],
         limits: Dict[str, int],
-        default_limit: int = 20,
+        default_limit: int = 80,
     ) -> Tuple[Dict[str, List[Fill]], Dict[str, int]]:
-        """
-        Returns (fills_by_product, updated_positions).
-        Positions dict is mutated in place and also returned.
-        """
-        fills_by_product: Dict[str, List[Fill]] = {}
 
-        # Pre-index market trades by symbol for fast lookup
-        mkt_by_symbol: Dict[str, list] = {}
-        for tr in market_trade_rows:
-            mkt_by_symbol.setdefault(tr.symbol, []).append(tr)
+        fills_by_product: Dict[str, List[Fill]] = {}
 
         for product, orders in orders_by_product.items():
             if not orders:
@@ -45,85 +42,66 @@ class OrderMatchMaker:
 
             limit = limits.get(product, default_limit)
             od    = order_depths.get(product)
-            mkt   = mkt_by_symbol.get(product, [])
+            pos   = positions.get(product, 0)
 
-            # Check if ANY order would breach the limit — if so, cancel ALL for this product
-            pos = positions.get(product, 0)
-            projected = pos
-            for o in orders:
-                projected += o.quantity
-            if projected > limit or projected < -limit:
-                # cancel all — Prosperity behaviour
-                continue
-
-            product_fills: List[Fill] = []
             book_bids = dict(od.buy_orders)  if od else {}
-            book_asks = dict(od.sell_orders) if od else {}  # values are negative
+            book_asks = dict(od.sell_orders) if od else {}
+
+            best_ask = min(book_asks.keys()) if book_asks else None
+            best_bid = max(book_bids.keys()) if book_bids else None
+
+            # simulate fills without committing
+            candidate_fills: List[Fill] = []
+            sim_pos = pos
+            sim_bids = dict(book_bids)
+            sim_asks = dict(book_asks)
 
             for order in orders:
-                remaining = order.quantity  # + buy, - sell
-                price     = order.price
+                qty_signed = order.quantity
+                price      = order.price
 
-                if remaining > 0:
-                    # BUY — match against ask side
-                    for ask in sorted(book_asks.keys()):
+                if qty_signed > 0:
+                    if best_ask is None or price < best_ask:
+                        continue
+                    remaining = qty_signed
+                    for ask in sorted(sim_asks.keys()):
                         if ask > price or remaining == 0:
                             break
-                        available = -book_asks[ask]
-                        qty = min(remaining, available, limit - pos)
+                        available = -sim_asks[ask]
+                        qty = max(0, min(remaining, available, limit - sim_pos))
                         if qty <= 0:
                             break
-                        product_fills.append(Fill(product, ask, qty))
-                        pos       += qty
-                        remaining -= qty
-                        book_asks[ask] += qty
-                        if book_asks[ask] == 0:
-                            del book_asks[ask]
+                        candidate_fills.append(Fill(product, ask, qty))
+                        sim_pos    += qty
+                        remaining  -= qty
+                        sim_asks[ask] += qty
+                        if sim_asks[ask] == 0:
+                            del sim_asks[ask]
 
-                    # Fallback: market trades
-                    for tr in mkt:
-                        if remaining == 0:
-                            break
-                        if tr.price > price:
-                            continue
-                        qty = min(remaining, tr.quantity, limit - pos)
-                        if qty <= 0:
-                            continue
-                        product_fills.append(Fill(product, price, qty))
-                        pos       += qty
-                        remaining -= qty
-
-                elif remaining < 0:
-                    # SELL — match against bid side
-                    sell_qty = -remaining
-                    for bid in sorted(book_bids.keys(), reverse=True):
+                elif qty_signed < 0:
+                    if best_bid is None or price > best_bid:
+                        continue
+                    sell_qty = -qty_signed
+                    for bid in sorted(sim_bids.keys(), reverse=True):
                         if bid < price or sell_qty == 0:
                             break
-                        available = book_bids[bid]
-                        qty = min(sell_qty, available, pos + limit)
+                        available = sim_bids[bid]
+                        qty = max(0, min(sell_qty, available, sim_pos + limit))
                         if qty <= 0:
                             break
-                        product_fills.append(Fill(product, bid, -qty))
-                        pos      -= qty
-                        sell_qty -= qty
-                        book_bids[bid] -= qty
-                        if book_bids[bid] == 0:
-                            del book_bids[bid]
+                        candidate_fills.append(Fill(product, bid, -qty))
+                        sim_pos   -= qty
+                        sell_qty  -= qty
+                        sim_bids[bid] -= qty
+                        if sim_bids[bid] == 0:
+                            del sim_bids[bid]
 
-                    # Fallback: market trades
-                    for tr in mkt:
-                        if sell_qty == 0:
-                            break
-                        if tr.price < price:
-                            continue
-                        qty = min(sell_qty, tr.quantity, pos + limit)
-                        if qty <= 0:
-                            continue
-                        product_fills.append(Fill(product, price, -qty))
-                        pos      -= qty
-                        sell_qty -= qty
+            # enforce limit — if sim_pos breaches, cancel all
+            if abs(sim_pos) > limit:
+                fills_by_product[product] = []
+                continue
 
-            positions[product] = pos
-            fills_by_product[product] = product_fills
+            positions[product] = sim_pos
+            fills_by_product[product] = candidate_fills
 
         return fills_by_product, positions
