@@ -250,7 +250,7 @@ class ProductTrader:
     
     def compute_vwap(self):
         """
-        state-dependent. 
+        state-dependent. Update 
         """
             
     def compute_make_ask_price(self):
@@ -431,10 +431,6 @@ class Trader:
         # save timestamp
         mr_trader.update_traderData()
         lin_trend_trader.update_traderData()
-
-        new_traderData.update(mr_trader.new_traderData)
-        new_traderData.update(lin_trend_trader.new_traderData)
-
 
         # STEP 5:ENCODE TraderData
         traderData = jsonpickle.encode(new_traderData)
