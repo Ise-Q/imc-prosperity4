@@ -42,7 +42,9 @@ class ProductTrader:
         self.name = name
         self.state = state
         self.timestamp = self.state.timestamp
-        self.new_traderData = new_traderData
+        self.new_traderData = new_traderData.setdefault(self.name, {}) # product specific trader data. Note that we use .setdefault() instead of .get(). 
+        # While in this case, the returned dictionary references to the same inner dictionary in new_traderData (because default_traderData() guarantees self.name is in the keys),  
+        # originally, it is a fragile method. So we instead use .setdefault(self.name, {}), which inserts the key (if not already in the original dict) and returns the value
 
         self.last_traderData = self._get_last_traderData()
         self.position_limit = POS_LIMITS.get(name, 0) # default to limit = 0 if prod not found in dict
@@ -66,12 +68,15 @@ class ProductTrader:
         if self.state.traderData and self.state.traderData != "":
             try:
                 last_traderData = jsonpickle.decode(self.state.traderData)
+                product_last_traderData = last_traderData.setdefault(self.name, {})
             except Exception:
                 # corrupt data -- reset cleanly
-                last_traderData = default_traderData() # TODO
-            return last_traderData
+                last_traderData = default_traderData()
+                product_last_traderData = last_traderData.setdefault(self.name, {})
+            return product_last_traderData
         else:
-            return default_traderData()
+            last_traderData = default_traderData()
+            product_last_traderData = last_traderData.setdefault(self.name, {})
 
     def _get_current_position(self):
         return self.state.position.get(self.name, 0)
@@ -174,7 +179,7 @@ class ProductTrader:
         self.expected_position -= abs_volume
 
     def update_traderData(self):
-        self.new_traderData[self.name]["last_timestamp"] = self.timestamp
+        self.new_traderData["last_timestamp"] = self.timestamp
 
 
     def compute_mid_price(self):
@@ -250,9 +255,13 @@ class ProductTrader:
     
     def compute_vwap(self):
         """
-        state-dependent. Update 
+        state-dependent. Update self.new_traderData
         """
+        if self.market_trades:
+            cross_product = sum([trade.price * trade.quantity for trade in self.market_trades])
+            total_volume = sum([trade.quantity for trade in self.market_trades])
             
+        self.new_traderData.get()
     def compute_make_ask_price(self):
         fair_ask_price = self.fair_value + self.make_margin
         if not self.quoted_sell_orders:
@@ -293,7 +302,7 @@ class MeanReversionTrader(ProductTrader):
         Falls back to 10000 if no order book available.
         """
         mid = self.compute_mid_price()
-        prev_ema = self.last_traderData[self.name].get("ema", None)
+        prev_ema = self.last_traderData.get("ema", None)
 
         if mid is None:
             # no order book - carry forward last EMA or default
@@ -309,7 +318,7 @@ class MeanReversionTrader(ProductTrader):
         fair = self.fv_method_weights[0] * self.static_fv + self.fv_method_weights[1] * ema
 
         # update new_traderData with ema computed in current iteration 
-        self.new_traderData[self.name]["ema"] = ema
+        self.new_traderData["ema"] = ema
         return round(fair)
     
     def _get_fv_method_weights(self):
@@ -374,7 +383,7 @@ class LinearTrendTrader(ProductTrader):
 
         we reverse engineer day_offset at first iteration and save it in traderData
         """
-        day_offset = self.last_traderData[self.name].get("day_offset", None)
+        day_offset = self.last_traderData.get("day_offset", None)
         if (day_offset is None):
             # if day offset is not included in trader data, we reverse engineer by using mid price
             day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
@@ -383,19 +392,19 @@ class LinearTrendTrader(ProductTrader):
             fair = self.alpha + self.beta * g_time_index
 
             # update trader data
-            self.new_traderData[self.name]["day_offset"] = day_offset
+            self.new_traderData["day_offset"] = day_offset
 
         else:
             # if day offset is in traderData, use it to compute fair
             # first check if we should use a new day_offset
-            if self.timestamp < self.last_traderData[self.name]["last_timestamp"]:
+            if self.timestamp < self.last_traderData["last_timestamp"]:
                 day_offset += 1 # increment day_offset by 1
 
 
             g_time_index = day_offset * 1_000_000 + self.timestamp
             fair = self.alpha + self.beta * g_time_index
             # update day offset
-            self.new_traderData[self.name]["day_offset"] = day_offset
+            self.new_traderData["day_offset"] = day_offset
         return round(fair)
 
 
