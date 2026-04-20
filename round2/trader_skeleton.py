@@ -19,12 +19,14 @@ PARAMS = {
       "static_fv" : 10_000,
       "fv_method_weights" : [1, 0], # [static, ema]
       "take_margin": 1,
-      "clear_margin": 6, "make_margin": 4
+      "clear_margin": 6, "make_margin": 4,
+      "vwap_window": 500
     },
     "INTARIAN_PEPPER_ROOT":{
         "slope": 0.001, "intercept": 12000.0,
         "take_margin": 1, "clear_margin": 2,
-        "make_margin": 2
+        "make_margin": 2,
+        "vwap_window": 500
     }
 }
 
@@ -48,6 +50,9 @@ class ProductTrader:
         self.starting_position = self._get_current_position()
         self.expected_position = self.starting_position # to be updated (mutatable)
 
+        self.market_trades = self._get_market_trades()
+        self.own_trades = self._get_own_trades()
+
         self.quoted_buy_orders, self.quoted_sell_orders = self._get_order_depth()
 
         self.max_allowed_buy_volume, self.max_allowed_sell_volume = self._get_max_allowed_volume()
@@ -70,6 +75,12 @@ class ProductTrader:
 
     def _get_current_position(self):
         return self.state.position.get(self.name, 0)
+
+    def _get_market_trades(self):
+        return self.state.market_trades.get(self.name, [])
+
+    def _get_own_trades(self):
+        return self.state.own_trades.get(self.name, [])
 
     def _get_order_depth(self):
         """
@@ -106,6 +117,16 @@ class ProductTrader:
 
     def _get_make_margin(self):
         return PARAMS.get(self.name, {}).get("make_margin",1)
+    
+    def _get_wall_level(self, side):
+        """Returns (price, volume) of the level with the largest resting size
+        on the given side, or (None, None) if empty.
+        side ∈ {'buy', 'sell'}."""
+        book = self.quoted_buy_orders if side == 'buy' else self.quoted_sell_orders
+        if not book:
+            return (None, None)
+        price, volume = max(book.items(), key=lambda x: x[1])
+        return (price, volume)
 
     def get_best_bid(self):
         if self.quoted_buy_orders:
@@ -122,11 +143,15 @@ class ProductTrader:
         Append a buy order that respects exchange's requirements, mainly:
             1. respect position limits
             2. is an Order object (price and volume must be ints)
+
+        A useful corollary of this structure: One need not care about rounding
+        price and volume calculations in other features since as long as orders
+        flow through this pipeline, prices will be automatically adjusted
         """
-        abs_volume = min(int(abs(volume)), self.max_allowed_buy_volume)
+        abs_volume = min(round(abs(volume)), self.max_allowed_buy_volume)
         # update allowed buy volume
         self.max_allowed_buy_volume -= abs_volume
-        order = Order(self.name, int(price), abs_volume)
+        order = Order(self.name, round(price), abs_volume)
         self.orders.append(order)
 
         # update expected position
@@ -139,10 +164,10 @@ class ProductTrader:
             1. respect position limits
             2. is an Order object (price and volume must be ints)
         """
-        abs_volume = min(int(abs(volume)), self.max_allowed_sell_volume)
+        abs_volume = min(round(abs(volume)), self.max_allowed_sell_volume)
         # update allowed sell volume
         self.max_allowed_sell_volume -= abs_volume
-        order = Order(self.name, int(price), -abs_volume)
+        order = Order(self.name, round(price), -abs_volume)
         self.orders.append(order)
 
         # updated expected position
@@ -159,12 +184,75 @@ class ProductTrader:
         if (bb is not None) and (bo is not None):
             return (bb + bo) / 2.0
 
-    def compute_wall_mid(self):
-        pass
+    def compute_wall_mid(self, weighted=False):
+        """Midpoint anchored at the deepest (highest-volume) resting level on
+        each side. If weighted=True, weights each wall price by the that side's
+        wall volume. Returns None if either side empty. Later, ffill() wall price 
+        at iterations when either side is empty."""
+        bid_p, bid_v = self._get_wall_level('buy')
+        ask_p, ask_v = self._get_wall_level('sell')
+        if bid_p is None or ask_p is None:
+            return None
+        if not weighted:
+            return (bid_p + ask_p) / 2.0
+        if bid_v + ask_v == 0:
+            return (bid_p + ask_p) / 2.0
+        return (ask_p * ask_v + bid_p * bid_v) / (bid_v + ask_v)
+        
+    def compute_liquidity_price(self):
+        """
+        This assumes mms post quotes that reflect most the fair value of the security.
+        Consequentially, higher volume at a lower bid price reflects that fair value is
+        dragged downwards, and vice versa for high volume at a high ask price.
 
-    def compute_VWAP(self):
-        pass
+        This is a competitng framework of the microprice framework. The foundations of microprice
+        are built on the premise that quotes reprsent mms' will to *absorb* orderflow.
+        For instance, higher volume at a certain bid price reflects mm's will to absorb any sell orders
+        coming through that level; therefore, fair value should be higher.
+        """
+        agg_ask_p = 0
+        agg_ask_v = 0
+        agg_bid_p = 0
+        agg_bid_v = 0
 
+        if self.quoted_sell_orders and self.quoted_buy_orders:
+            for sp, sv in self.quoted_sell_orders.items():
+                agg_ask_p += sp * sv
+                agg_ask_v += sv
+            for bp, bv in self.quoted_buy_orders.items():
+                agg_bid_p += bp * bv
+                agg_bid_v += bv
+            
+            if not (agg_bid_v or agg_ask_v):
+                return None  # if both volumes are zero return None
+            
+            liq_price = (agg_bid_p + agg_ask_p) / (agg_bid_v + agg_ask_v)
+                  
+            return liq_price
+        
+    def compute_microprice(self):
+        """
+        microprice from stoikov(2017).
+        """
+
+        if self.quoted_sell_orders and self.quoted_buy_orders:
+            best_ask_p = next(iter(self.quoted_sell_orders))
+            best_ask_v = self.quoted_sell_orders.get(best_ask_p, 0)
+                        
+            best_bid_p = next(iter(self.quoted_bid_orders))
+            best_bid_v = self.quoted_bid_orders.get(best_bid_p, 0)
+
+            if not (best_ask_v or best_bid_v): # both volumes are zero
+                return None
+        
+            microprice = (best_ask_p * best_bid_v + best_bid_p * best_ask_v) / (best_ask_v + best_bid_v)
+            return microprice
+    
+    def compute_vwap(self):
+        """
+        state-dependent. 
+        """
+            
     def compute_make_ask_price(self):
         fair_ask_price = self.fair_value + self.make_margin
         if not self.quoted_sell_orders:
