@@ -1,5 +1,6 @@
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List
+from functools import cached_property
 import jsonpickle
 import numpy as np
 import statistics
@@ -24,6 +25,7 @@ PARAMS = {
     },
     "INTARIAN_PEPPER_ROOT":{
         "slope": 0.001, "intercept": 12000.0,
+        "ema_alpha": 0.05,
         "take_margin": 1, "clear_margin": 2,
         "make_margin": 2,
         "vwap_window": 500
@@ -37,7 +39,7 @@ def default_traderData():
 
 # base ProductTrader
 class ProductTrader:
-    def __init__(self, name, state, new_traderData):
+    def __init__(self, name, state, last_traderData, new_traderData):
         self.orders = []
         self.name = name
         self.state = state
@@ -46,7 +48,9 @@ class ProductTrader:
         # While in this case, the returned dictionary references to the same inner dictionary in new_traderData (because default_traderData() guarantees self.name is in the keys),  
         # originally, it is a fragile method. So we instead use .setdefault(self.name, {}), which inserts the key (if not already in the original dict) and returns the value
 
-        self.last_traderData = self._get_last_traderData()
+        self.params = PARAMS.get(self.name, {})
+
+        self.last_traderData = last_traderData.get(self.name, {})
         self.position_limit = POS_LIMITS.get(name, 0) # default to limit = 0 if prod not found in dict
 
         self.starting_position = self._get_current_position()
@@ -63,6 +67,12 @@ class ProductTrader:
         self.clear_margin = self._get_clear_margin()
         self.make_margin = self._get_make_margin()
 
+        # Parms
+        self.ema_alpha = self.params.get("ema_alpha", 0.05)
+
+    @cached_property
+    def vwap(self):
+        return self.compute_vwap()
 
     def _get_last_traderData(self):
         if self.state.traderData and self.state.traderData != "":
@@ -77,6 +87,7 @@ class ProductTrader:
         else:
             last_traderData = default_traderData()
             product_last_traderData = last_traderData.setdefault(self.name, {})
+            return product_last_traderData
 
     def _get_current_position(self):
         return self.state.position.get(self.name, 0)
@@ -115,13 +126,13 @@ class ProductTrader:
 
     # define generic lookups for margins, but we can override them by redefining them in inherited classes
     def _get_take_margin(self):
-        return PARAMS.get(self.name, {}).get("take_margin", 1)
+        return self.params.get("take_margin", 1)
 
     def _get_clear_margin(self):
-        return PARAMS.get(self.name, {}).get("clear_margin",0)
+        return self.params.get("clear_margin",0)
 
     def _get_make_margin(self):
-        return PARAMS.get(self.name, {}).get("make_margin",1)
+        return self.params.get("make_margin",1)
     
     def _get_wall_level(self, side):
         """Returns (price, volume) of the level with the largest resting size
@@ -234,6 +245,31 @@ class ProductTrader:
             liq_price = (agg_bid_p + agg_ask_p) / (agg_bid_v + agg_ask_v)
                   
             return liq_price
+    
+    def compute_imbalance_price(self):
+        bb = self.get_best_bid()
+        ba = self.get_best_ask()
+
+        if (bb is None) or (ba is None):
+            return self.compute_mid_price()
+
+ 
+        total_buy_volume = sum(self.quoted_buy_orders.values())
+        total_sell_volume = sum(self.quoted_sell_orders.values())
+        
+        total_volume = total_buy_volume + total_sell_volume
+        
+        if not total_volume: 
+            return self.compute_mid_price()
+        
+        mid = (ba + bb) / 2
+        spread = ba - bb
+        imbalance = (total_buy_volume - total_sell_volume) / total_volume
+        imbalance_price = mid + imbalance * (spread / 2)
+
+        return imbalance_price
+        
+            
         
     def compute_microprice(self):
         """
@@ -244,8 +280,8 @@ class ProductTrader:
             best_ask_p = next(iter(self.quoted_sell_orders))
             best_ask_v = self.quoted_sell_orders.get(best_ask_p, 0)
                         
-            best_bid_p = next(iter(self.quoted_bid_orders))
-            best_bid_v = self.quoted_bid_orders.get(best_bid_p, 0)
+            best_bid_p = next(iter(self.quoted_buy_orders))
+            best_bid_v = self.quoted_buy_orders.get(best_bid_p, 0)
 
             if not (best_ask_v or best_bid_v): # both volumes are zero
                 return None
@@ -255,13 +291,58 @@ class ProductTrader:
     
     def compute_vwap(self):
         """
-        state-dependent. Update self.new_traderData
+        state-dependent. Make sure you only run the method
+        ONCE per product per time iteration, so that you don't store duplicate values. 
+
+        Use self.vwap when vwap is needed as an input to other methods.
         """
+        vwap_window = self.params["vwap_window"]
+        vwap_history = list(self.last_traderData.get("vwap_history", [])) # return a new object instead of the pointer to last_traderData["vwap_history"]
         if self.market_trades:
-            cross_product = sum([trade.price * trade.quantity for trade in self.market_trades])
-            total_volume = sum([trade.quantity for trade in self.market_trades])
-            
-        self.new_traderData.get()
+            sum_product = sum([trade.price * trade.quantity for trade in self.market_trades])
+            tick_volume = sum([trade.quantity for trade in self.market_trades])
+            if tick_volume > 0:
+                tick_vwap = sum_product / tick_volume
+                vwap_history.append((tick_vwap, tick_volume))
+        
+        vwap_history = vwap_history[-vwap_window:]
+      
+        total_sumproduct = sum([p*v for p, v in vwap_history])
+        total_volume = sum([v for p, v in vwap_history])
+        vwap = total_sumproduct / total_volume if total_volume > 0 else None
+
+        # update new traderData
+        self.new_traderData["vwap_history"] = vwap_history
+
+        return vwap
+    
+    def compute_ema(self):
+        """
+        state dependent
+        """
+
+        mid = self.compute_mid_price()
+        prev_ema = self.last_traderData.get("ema", None)
+
+        if mid is None and prev_ema is None:
+            return #  if prev_ema, mid are None, then return None
+            # no order book - carry forward last EMA or default
+        
+        elif mid is None and prev_ema is not None:
+            ema = prev_ema
+    
+        elif mid is not None and prev_ema is None:
+            # first tick - initialize EMA with mid
+            ema = mid
+        else: # both mid and prev_ema are not None
+            ema = self.ema_alpha * mid + (1 - self.ema_alpha) * prev_ema
+    
+
+        # update new_traderData with ema computed in current iteration 
+        self.new_traderData["ema"] = ema
+        return ema  
+
+
     def compute_make_ask_price(self):
         fair_ask_price = self.fair_value + self.make_margin
         if not self.quoted_sell_orders:
@@ -288,12 +369,14 @@ class ProductTrader:
 
 
 class MeanReversionTrader(ProductTrader):
-    def __init__(self, state, new_traderData):
-        super().__init__("ASH_COATED_OSMIUM", state, new_traderData)
-        self.ema_alpha = PARAMS[self.name]["ema_alpha"]
-        self.fair_value = self.compute_fair_value()
+    def __init__(self, state, last_traderData, new_traderData):
+        super().__init__("ASH_COATED_OSMIUM", state, last_traderData, new_traderData)
         self.static_fv = self._get_static_fv()
         self.fv_method_weights = self._get_fv_method_weights()
+
+        
+        self.fair_value = self.compute_fair_value()
+        
 
     def compute_fair_value(self):
         """
@@ -301,39 +384,26 @@ class MeanReversionTrader(ProductTrader):
         Persists EMA state across ticks via traderData.
         Falls back to 10000 if no order book available.
         """
-        mid = self.compute_mid_price()
-        prev_ema = self.last_traderData.get("ema", None)
-
-        if mid is None:
-            # no order book - carry forward last EMA or default
-            ema = prev_ema if prev_ema is not None else 10000
-        elif prev_ema is None:
-            # first tick - initialize EMA with mid
-            ema = mid
-        else:
-            ema = self.ema_alpha * mid + (1 - self.ema_alpha) * prev_ema
-        
+       
         # weight between static fair value and ema
-
+        ema = self.compute_ema() # new ema is also updated to new_traderData
+        if ema is None:
+            return self.static_fv
         fair = self.fv_method_weights[0] * self.static_fv + self.fv_method_weights[1] * ema
 
-        # update new_traderData with ema computed in current iteration 
-        self.new_traderData["ema"] = ema
         return round(fair)
     
     def _get_fv_method_weights(self):
-        params = PARAMS.get(self.name, {})
-        weights = params.get("fv_method_weights", [])
+        weights = self.params.get("fv_method_weights", [])
         # make sure weights are normalized to sum 1
         if weights:
-            weights = weights / sum(weights)
+            weights = [w / sum(weights) for w in weights]
 
         return weights
 
 
     def _get_static_fv(self):
-        params = PARAMS.get(self.name, {})
-        return params.get("static_fv", 10_000) # default to 10_000
+        return self.params.get("static_fv", 10_000) # default to 10_000
         
 
     def get_orders(self):
@@ -368,10 +438,10 @@ class MeanReversionTrader(ProductTrader):
 
 
 class LinearTrendTrader(ProductTrader):
-    def __init__(self, state, new_traderData):
-        super().__init__("INTARIAN_PEPPER_ROOT", state, new_traderData)
-        self.alpha = PARAMS[self.name]["intercept"]
-        self.beta = PARAMS[self.name]["slope"]
+    def __init__(self, state, last_traderData, new_traderData):
+        super().__init__("INTARIAN_PEPPER_ROOT", state, last_traderData, new_traderData)
+        self.alpha = self.params["intercept"]
+        self.beta = self.params["slope"]
         self.fair_value = self.compute_fair_value()
 
     def compute_fair_value(self):
@@ -385,11 +455,18 @@ class LinearTrendTrader(ProductTrader):
         """
         day_offset = self.last_traderData.get("day_offset", None)
         if (day_offset is None):
-            # if day offset is not included in trader data, we reverse engineer by using mid price
-            day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
+            mid = self.compute_mid_price()
+            if mid is not None:
+            
+                # if day offset is not included in trader data, we reverse engineer by using mid price
+                day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
 
-            g_time_index = day_offset * 1_000_000 + self.timestamp
-            fair = self.alpha + self.beta * g_time_index
+                g_time_index = day_offset * 1_000_000 + self.timestamp
+                fair = self.alpha + self.beta * g_time_index
+            else:
+                day_offset = 0 # delay reverse engineering to next step
+                g_time_index = day_offset * 1_000_000 + self.timestamp
+                fair = self.alpha + self.beta * g_time_index
 
             # update trader data
             self.new_traderData["day_offset"] = day_offset
@@ -397,7 +474,7 @@ class LinearTrendTrader(ProductTrader):
         else:
             # if day offset is in traderData, use it to compute fair
             # first check if we should use a new day_offset
-            if self.timestamp < self.last_traderData["last_timestamp"]:
+            if self.timestamp < self.last_traderData.get("last_timestamp", self.timestamp):
                 day_offset += 1 # increment day_offset by 1
 
 
@@ -425,12 +502,13 @@ class LinearTrendTrader(ProductTrader):
 class Trader:
     def run(self, state: TradingState):
         result : Dict[str, List[Order]] = {}
-        # STEP 1:intiialize new traderdata
+        # STEP 1:intiialize new traderdata and get last_traderData
         new_traderData = default_traderData()
+        last_traderData = jsonpickle.decode(state.traderData) if state.traderData else default_traderData()
 
         # STEP 2: intialize trader classes
-        mr_trader = MeanReversionTrader(state, new_traderData)
-        lin_trend_trader = LinearTrendTrader(state, new_traderData)
+        mr_trader = MeanReversionTrader(state, last_traderData, new_traderData)
+        lin_trend_trader = LinearTrendTrader(state, last_traderData, new_traderData)
 
         # STEP 3: get orders
         result.update(mr_trader.get_orders())
