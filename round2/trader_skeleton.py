@@ -7,7 +7,8 @@ import statistics
 import math
 
 
-# ASH: EMA(alpha = 0.05) fair value + take/clear/make | IPR: buy-and-hold
+# ASH: EMA(alpha = 0.05) and static_fair_value + take/make
+# IPR: buy-and-hold
 
 PRODUCTS = ["INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM"]
 POS_LIMITS = {
@@ -500,6 +501,9 @@ class LinearTrendTrader(ProductTrader):
 
 
 class Trader:
+    def bid(self):
+        return 0
+
     def run(self, state: TradingState):
         result : Dict[str, List[Order]] = {}
         # STEP 1:intiialize new traderdata and get last_traderData
