@@ -19,7 +19,7 @@ PARAMS = {
     "ASH_COATED_OSMIUM": {
       "ema_alpha": 0.05,
       "static_fv" : 10_000,
-      "fv_method_weights" : [0.5, 0.5], # [static, ema]
+      "fv_method_weights" : [0, 1], # [static, ema]
       "take_margin": 3,
       "clear_margin": 6, "make_margin": 4,
       "vwap_window": 500
