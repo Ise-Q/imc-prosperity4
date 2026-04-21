@@ -37,7 +37,7 @@ PARAMS = {
         "take_margin": 1, "clear_margin": 2,
         "make_margin": 2,
     }
-}
+} 
 
 # define default traderData
 def default_traderData():
