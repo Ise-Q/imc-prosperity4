@@ -7,7 +7,7 @@ import statistics
 import math
 
 
-# ASH: static_fair_value + take/make
+# ASH: EMA(alpha = 0.05) and static_fair_value + take/make
 # IPR: buy-and-hold
 
 PRODUCTS = ["INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM"]
@@ -17,19 +17,25 @@ POS_LIMITS = {
 }
 PARAMS = {
     "ASH_COATED_OSMIUM": {
-      "ema_alpha": 0.05,
+      "ema_configs": {
+          "mid_ema": {"alpha": 0.05, "source": "mid"},
+          "imbalance_ema" : {"alpha": 0.05, "source": "imbalance"}, 
+          "vwap_ema" : {"alpha": 0.05, "source": "vwap"},
+          "micro_ema" : {"alpha": 0.05, "source": "microprice"}, 
+          # e.g. "vwap_ema": {"alpha": 0.10, "source": "vwap"},
+      },
       "static_fv" : 10_000,
       "fv_method_weights" : [0.5, 0.5], # [static, ema]
-      "take_margin": 3,
+      "take_margin": 1,
       "clear_margin": 6, "make_margin": 4,
-      "vwap_window": 500
     },
     "INTARIAN_PEPPER_ROOT":{
+        "ema_configs": {
+            "mid_ema": {"alpha": 0.05, "source": "mid"},
+        },
         "slope": 0.001, "intercept": 12000.0,
-        "ema_alpha": 0.05,
         "take_margin": 1, "clear_margin": 2,
         "make_margin": 2,
-        "vwap_window": 500
     }
 }
 
@@ -68,8 +74,14 @@ class ProductTrader:
         self.clear_margin = self._get_clear_margin()
         self.make_margin = self._get_make_margin()
 
-        # Parms
-        self.ema_alpha = self.params.get("ema_alpha", 0.05)
+    _EMA_SOURCES = {
+        "mid":         "compute_mid_price",
+        "vwap":        "compute_vwap",
+        "microprice":  "compute_microprice",
+        "imbalance":   "compute_imbalance_price",
+        "wall_mid":    "compute_wall_mid",
+        "liquidity":   "compute_liquidity_price",
+    }
 
     @cached_property
     def vwap(self):
@@ -292,56 +304,46 @@ class ProductTrader:
     
     def compute_vwap(self):
         """
-        state-dependent. Make sure you only run the method
-        ONCE per product per time iteration, so that you don't store duplicate values. 
+        This tick's VWAP from market trades; None if no trades.
 
-        Use self.vwap when vwap is needed as an input to other methods.
+        Smoothing across ticks is the EMA alpha's job — feed this into
+        compute_ema(config_name) with a config whose source is "vwap".
         """
-        vwap_window = self.params["vwap_window"]
-        vwap_history = list(self.last_traderData.get("vwap_history", [])) # return a new object instead of the pointer to last_traderData["vwap_history"]
-        if self.market_trades:
-            sum_product = sum([trade.price * trade.quantity for trade in self.market_trades])
-            tick_volume = sum([trade.quantity for trade in self.market_trades])
-            if tick_volume > 0:
-                tick_vwap = sum_product / tick_volume
-                vwap_history.append((tick_vwap, tick_volume))
-        
-        vwap_history = vwap_history[-vwap_window:]
-      
-        total_sumproduct = sum([p*v for p, v in vwap_history])
-        total_volume = sum([v for p, v in vwap_history])
-        vwap = total_sumproduct / total_volume if total_volume > 0 else None
-
-        # update new traderData
-        self.new_traderData["vwap_history"] = vwap_history
-
-        return vwap
+        if not self.market_trades:
+            return None
+        sum_product = sum(t.price * t.quantity for t in self.market_trades)
+        tick_volume = sum(t.quantity for t in self.market_trades)
+        return sum_product / tick_volume if tick_volume > 0 else None
     
-    def compute_ema(self):
+    def compute_ema(self, config_name):
         """
-        state dependent
+        EMA for the named config. Reads alpha/source from
+        self.params['ema_configs'][config_name]. Persists under the same
+        name in new_traderData so multiple EMAs (mid, vwap, microprice, ...)
+        coexist without colliding.
         """
+        cfg = self.params["ema_configs"][config_name]
+        alpha = cfg["alpha"]
+        source = cfg["source"]
 
-        mid = self.compute_mid_price()
-        prev_ema = self.last_traderData.get("ema", None)
+        method_name = self._EMA_SOURCES.get(source)
+        if method_name is None:
+            raise ValueError(f"Unknown EMA source: {source!r}")
+        signal = getattr(self, method_name)()
 
-        if mid is None and prev_ema is None:
-            return #  if prev_ema, mid are None, then return None
-            # no order book - carry forward last EMA or default
-        
-        elif mid is None and prev_ema is not None:
+        prev_ema = self.last_traderData.get(config_name, None)
+
+        if signal is None and prev_ema is None:
+            return None
+        if signal is None:
             ema = prev_ema
-    
-        elif mid is not None and prev_ema is None:
-            # first tick - initialize EMA with mid
-            ema = mid
-        else: # both mid and prev_ema are not None
-            ema = self.ema_alpha * mid + (1 - self.ema_alpha) * prev_ema
-    
+        elif prev_ema is None:
+            ema = signal
+        else:
+            ema = alpha * signal + (1 - alpha) * prev_ema
 
-        # update new_traderData with ema computed in current iteration 
-        self.new_traderData["ema"] = ema
-        return ema  
+        self.new_traderData[config_name] = ema
+        return ema
 
 
     def compute_make_ask_price(self):
@@ -387,11 +389,11 @@ class MeanReversionTrader(ProductTrader):
         """
        
         # weight between static fair value and ema
-        ema = self.compute_ema() # new ema is also updated to new_traderData
-        if ema is None:
+        microprice_ema = self.compute_ema("micro_ema")
+   
+        if microprice_ema is None:
             return self.static_fv
-        fair = self.fv_method_weights[0] * self.static_fv + self.fv_method_weights[1] * ema
-
+        fair = self.fv_method_weights[0] * self.static_fv + self.fv_method_weights[1] * microprice_ema
         return round(fair)
     
     def _get_fv_method_weights(self):
@@ -503,6 +505,9 @@ class LinearTrendTrader(ProductTrader):
 
 
 class Trader:
+    def bid(self):
+        return 0
+
     def run(self, state: TradingState):
         result : Dict[str, List[Order]] = {}
         # STEP 1:intiialize new traderdata and get last_traderData
