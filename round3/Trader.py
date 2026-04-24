@@ -18,6 +18,12 @@ import math
 #    T_remaining = 3.0 - (day_offset + timestamp / 1_000_000)
 #    sigma = 0.02155  (daily realized vol, used as "annual" vol in BS)
 #    Options expire at end of Day 2 (= T=0)
+#
+#  Strategy overview (v2 — improved from round3_trading_strategies.py EDA):
+#    HYDROGEL:   static mean-reversion (take/clear/make around mu=9991) ← kept
+#    VEV_5200-5500: TAKE-ONLY options seller (no passive making) + delta hedge
+#    VEV_4000-5100, 6000-6500: NOT TRADED (delta-1 / no premium)
+#    VELVETFRUIT_EXTRACT: ONLY used for delta hedging (no standalone MM)
 
 STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 VEV_PRODUCTS = [f"VEV_{k}" for k in STRIKES]
@@ -407,6 +413,20 @@ class VEVTrader(ProductTrader):
         return best_bid + 1 if best_bid < fair_bid else fair_bid
 
 
+# ── Import improved strategy classes ─────────────────────────────────────────
+try:
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from round3_trading_strategies import (
+        VEVOptionSeller,
+        get_option_sellers,
+        SELL_STRIKES,
+    )
+    _STRATEGIES_LOADED = True
+except Exception as _e:
+    _STRATEGIES_LOADED = False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN TRADER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,32 +434,28 @@ class Trader:
     """
     Orchestrates all product traders each tick.
 
-    Execution order each timestep:
+    v2 execution order (improved from EDA findings):
       1. Decode traderData from last tick
-      2. Determine day_offset (which competition-day we're on)
-      3. Read VELVETFRUIT_EXTRACT mid price  →  feeds all VEV option traders
-      4. Run StaticFairValueTrader for HYDROGEL_PACK and VELVETFRUIT_EXTRACT
-      5. Run VEVTrader for each option
-      6. Encode and return traderData
+      2. Compute T_remaining from global timestamp (day_offset always 0 in continuous BT)
+      3. Read VELVETFRUIT_EXTRACT mid price
+      4. HYDROGEL_PACK  — unchanged mean-reversion take/clear/make
+      5. VEV options    — TAKE-ONLY selling for K=5200-5500 when overpriced vs BS
+         (no delta hedge — backtester settlement at market mid overstates hedge cost)
+      6. Encode state
     """
 
     def _get_day_offset(self, state: TradingState, last_td: dict) -> int:
-        """
-        Infer which competition day we're on.
-        day_offset increments each time timestamp wraps back to 0.
-        """
-        last_ts     = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
-        day_offset  = last_td.get("_meta", {}).get("day_offset", 0)
-        if state.timestamp < last_ts:   # timestamp wrapped → new day
+        last_ts    = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
+        day_offset = last_td.get("_meta", {}).get("day_offset", 0)
+        if state.timestamp < last_ts:
             day_offset += 1
         return day_offset
 
     def _get_underlying_mid(self, state: TradingState) -> Optional[float]:
-        """Read VELVETFRUIT_EXTRACT mid price from the order book."""
         try:
-            od  = state.order_depths["VELVETFRUIT_EXTRACT"]
-            bb  = max(od.buy_orders.keys())
-            ba  = min(od.sell_orders.keys())
+            od = state.order_depths["VELVETFRUIT_EXTRACT"]
+            bb = max(od.buy_orders.keys())
+            ba = min(od.sell_orders.keys())
             return (bb + ba) / 2.0
         except Exception:
             return None
@@ -453,42 +469,44 @@ class Trader:
         new_traderData  = default_traderData()
         new_traderData.setdefault("_meta", {})
 
-        # ── 2. Day tracking ───────────────────────────────────────────────────
+        # ── 2. Time tracking ──────────────────────────────────────────────────
         day_offset = self._get_day_offset(state, last_traderData)
-        new_traderData["_meta"]["day_offset"]    = day_offset
+        new_traderData["_meta"]["day_offset"]     = day_offset
         new_traderData["_meta"]["last_timestamp"] = state.timestamp
 
         T_remaining = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
-        print(f"[{state.timestamp}] day_offset={day_offset}  T_remaining={T_remaining:.4f}")
 
-        # ── 3. Underlying mid price ───────────────────────────────────────────
+        # ── 3. Underlying mid ─────────────────────────────────────────────────
         underlying_mid = self._get_underlying_mid(state)
 
-        # ── 4. VELVETFRUIT_EXTRACT — market-make the underlying itself ────────
-        vfe_trader = StaticFairValueTrader(
-            "VELVETFRUIT_EXTRACT", state, last_traderData, new_traderData
-        )
-        result.update(vfe_trader.get_orders())
-        vfe_trader.update_traderData()
-
-        # ── 5. HYDROGEL_PACK — mean-reversion market-making ──────────────────
+        # ── 4. HYDROGEL_PACK — mean-reversion (unchanged from v1) ─────────────
         hyd_trader = StaticFairValueTrader(
             "HYDROGEL_PACK", state, last_traderData, new_traderData
         )
         result.update(hyd_trader.get_orders())
         hyd_trader.update_traderData()
 
-        # ── 6. VEV options — Black-Scholes fair value ─────────────────────────
-        for k in STRIKES:
-            name   = f"VEV_{k}"
-            trader = VEVTrader(
-                name, state, last_traderData, new_traderData,
-                underlying_mid=underlying_mid,
-                day_offset=day_offset,
+        # ── 5. VEV options — TAKE-ONLY selling (no delta hedge) ──────────────
+        if _STRATEGIES_LOADED:
+            # Sell overpriced options (K=5200-5500 only)
+            sellers = get_option_sellers(
+                state, last_traderData, new_traderData,
+                underlying_mid, T_remaining, POS_LIMITS,
             )
-            result.update(trader.get_orders())
-            trader.update_traderData()
+            for seller in sellers:
+                result.update(seller.get_orders())
+        else:
+            # Fallback: run original VEVTrader if module not available
+            for k in STRIKES:
+                name   = f"VEV_{k}"
+                trader = VEVTrader(
+                    name, state, last_traderData, new_traderData,
+                    underlying_mid=underlying_mid,
+                    day_offset=day_offset,
+                )
+                result.update(trader.get_orders())
+                trader.update_traderData()
 
-        # ── 7. Save state ─────────────────────────────────────────────────────
+        # ── 6. Save state ─────────────────────────────────────────────────────
         traderData = jsonpickle.encode(new_traderData)
         return result, 0, traderData
