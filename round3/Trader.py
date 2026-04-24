@@ -1,66 +1,68 @@
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List, Optional
-from functools import cached_property
 import jsonpickle
-import numpy as np
 import math
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROUND 3 PRODUCTS & CONFIG
+#  ROUND 3 — "GLOVES OFF"
+#  Products: VELVETFRUIT_EXTRACT, HYDROGEL_PACK, VEV_4000 … VEV_6500
+#
+#  TTE convention (confirmed from Round 3 rules):
+#    Options have a 7-day expiry starting from Round 1.
+#    At the START of Round 3, TTE = 5 days.
+#    Each competition day = 1,000,000 ticks (timestamps 0 → 999900, step 100).
+#    Inside Round 3:
+#        TTE = 5.0 - (day_offset + timestamp / 1_000_000)
+#
+#  Sigma convention:
+#    1 "year" in Black-Scholes = 1 competition day.
+#    SIGMA_FALLBACK = 0.01262 (ATM implied vol calibrated from historical data
+#    with correct TTE values). The trader updates sigma live using a rolling
+#    window of implied vols computed from market prices (more robust than fixed).
+#
+#  Position limits (from official Round 3 rules):
+#    HYDROGEL_PACK       → 200
+#    VELVETFRUIT_EXTRACT → 200
+#    VEV_XXXX (each)     → 300
 # ─────────────────────────────────────────────────────────────────────────────
-#
-#  VELVETFRUIT_EXTRACT  — underlying asset, mean ~5250, tight spread ~5
-#  VEV_XXXX             — call options on the underlying (strikes 4000–6500)
-#  HYDROGEL_PACK        — mean-reverting product, mean ~9991, spread ~16
-#
-#  Options pricing convention (calibrated from data):
-#    1 "year" in Black-Scholes = 1 competition day
-#    T_remaining = 3.0 - (day_offset + timestamp / 1_000_000)
-#    sigma = 0.02155  (daily realized vol, used as "annual" vol in BS)
-#    Options expire at end of Day 2 (= T=0)
 
-STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
-VEV_PRODUCTS = [f"VEV_{k}" for k in STRIKES]
+STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+VEV_NAMES   = [f"VEV_{k}" for k in STRIKES]
+ALL_PRODUCTS = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_NAMES
 
-PRODUCTS = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_PRODUCTS
-
-# !! UPDATE THESE once you see the official position limits for Round 3 !!
 POS_LIMITS = {
-    "VELVETFRUIT_EXTRACT": 600,
-    "HYDROGEL_PACK":        50,
-    **{f"VEV_{k}": 200 for k in STRIKES},
+    "VELVETFRUIT_EXTRACT" : 200,
+    "HYDROGEL_PACK"       : 200,
+    **{f"VEV_{k}": 300 for k in STRIKES},
 }
 
-# Options BS parameters (from analysis.py)
-SIGMA        = 0.02155   # calibrated realized vol
-EXPIRY_DAYS  = 3.0       # options expire end of Day 2
-RISK_FREE    = 0.0
+SIGMA_FALLBACK = 0.01262   # ATM IV from historical data; used until rolling IV warms up
+TTE_AT_R3_START = 5.0      # TTE when Round 3 begins
+IV_WINDOW       = 100      # rolling window length (ticks) for implied vol smoothing
 
 PARAMS = {
-    # ── Underlying: simple market-making around mid ──────────────────────────
+    # Underlying: market-make around a slow EMA of mid
     "VELVETFRUIT_EXTRACT": {
-        "ema_configs"       : {"mid_ema": {"alpha": 0.05, "source": "mid"}},
-        "fv_method_weights" : [0, 1],   # pure EMA (underlying has no fixed fair value)
-        "take_margin"       : 2,
-        "clear_margin"      : 3,
-        "make_margin"       : 3,
+        "ema_alpha"   : 0.05,
+        "take_margin" : 2,
+        "clear_margin": 3,
+        "make_margin" : 3,
     },
-    # ── HYDROGEL: static fair-value market-making ────────────────────────────
+    # HYDROGEL: static fair-value market-making around long-run mean
     "HYDROGEL_PACK": {
-        "ema_configs"       : {"mid_ema": {"alpha": 0.03, "source": "mid"}},
-        "static_fv"         : 9991,     # long-run mean from data
-        "fv_method_weights" : [1, 0],   # pure static
-        "take_margin"       : 2,
-        "clear_margin"      : 4,
-        "make_margin"       : 3,
+        "static_fv"   : 9991,
+        "ema_alpha"   : 0.03,
+        "take_margin" : 2,
+        "clear_margin": 4,
+        "make_margin" : 3,
     },
-    # ── VEV options: BS fair value (computed dynamically, not in PARAMS) ─────
+    # Each VEV: BS-priced, margins around fair value
     **{
         f"VEV_{k}": {
             "strike"      : k,
-            "take_margin" : 3,   # only trade if |market - BS| > 3 ticks
+            "take_margin" : 3,
             "clear_margin": 2,
-            "make_margin" : 5,   # quote 5 ticks either side of BS fair
+            "make_margin" : 5,
         }
         for k in STRIKES
     },
@@ -68,343 +70,275 @@ PARAMS = {
 
 
 def default_traderData():
-    return {product: {} for product in PRODUCTS}
+    return {p: {} for p in ALL_PRODUCTS + ["_meta"]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BASE CLASS  (copied from Jay's template, unchanged)
+#  BLACK-SCHOLES  (pure math — safe for competition, no scipy needed)
+# ─────────────────────────────────────────────────────────────────────────────
+def _ncdf(x: float) -> float:
+    """Standard normal CDF via math.erf."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+
+def bs_call(S: float, K: float, T: float, sigma: float) -> float:
+    """Black-Scholes call price. T and sigma both in competition-day units."""
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * _ncdf(d1) - K * _ncdf(d2)
+
+def bs_delta(S: float, K: float, T: float, sigma: float) -> float:
+    """BS call delta (dC/dS). Used for optional delta-hedging of underlying."""
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    return _ncdf(d1)
+
+def implied_vol(mkt: float, S: float, K: float, T: float) -> Optional[float]:
+    """
+    Implied vol via bisection (50 steps → ~1e-14 precision).
+    Returns None when market is at intrinsic or unsolvable.
+    """
+    intrinsic = max(S - K, 0.0)
+    if mkt <= intrinsic + 0.01 or T <= 0:
+        return None
+    lo, hi = 1e-4, 3.0
+    if bs_call(S, K, T, hi) < mkt:
+        return None
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if bs_call(S, K, T, mid) < mkt:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BASE PRODUCT TRADER  (Jay's architecture)
 # ─────────────────────────────────────────────────────────────────────────────
 class ProductTrader:
-    def __init__(self, name, state, last_traderData, new_traderData):
-        self.orders   = []
-        self.name     = name
-        self.state    = state
-        self.timestamp = self.state.timestamp
-        self.new_traderData  = new_traderData.setdefault(self.name, {})
-        self.params          = PARAMS.get(self.name, {})
-        self.last_traderData = last_traderData.get(self.name, {})
-        self.position_limit  = POS_LIMITS.get(name, 0)
+    def __init__(self, name: str, state: TradingState,
+                 last_td: dict, new_td: dict):
+        self.orders    = []
+        self.name      = name
+        self.state     = state
+        self.timestamp = state.timestamp
+        self.new_td    = new_td.setdefault(name, {})
+        self.last_td   = last_td.get(name, {})
+        self.params    = PARAMS.get(name, {})
+        self.pos_limit = POS_LIMITS.get(name, 0)
 
-        self.starting_position = self._get_current_position()
-        self.expected_position = self.starting_position
+        self.position  = state.position.get(name, 0)
+        self.market_trades = state.market_trades.get(name, [])
 
-        self.market_trades = self._get_market_trades()
-        self.own_trades    = self._get_own_trades()
+        self.bids, self.asks = self._parse_book()
+        self.max_buy  = self.pos_limit - self.position
+        self.max_sell = self.pos_limit + self.position
 
-        self.quoted_buy_orders, self.quoted_sell_orders = self._get_order_depth()
-        self.max_allowed_buy_volume, self.max_allowed_sell_volume = self._get_max_allowed_volume()
-
-        self.take_margin  = self._get_take_margin()
-        self.clear_margin = self._get_clear_margin()
-        self.make_margin  = self._get_make_margin()
-
-    _EMA_SOURCES = {
-        "mid"        : "compute_mid_price",
-        "vwap"       : "compute_vwap",
-        "microprice" : "compute_microprice",
-        "imbalance"  : "compute_imbalance_price",
-        "wall_mid"   : "compute_wall_mid",
-    }
-
-    def _get_current_position(self):
-        return self.state.position.get(self.name, 0)
-
-    def _get_market_trades(self):
-        return self.state.market_trades.get(self.name, [])
-
-    def _get_own_trades(self):
-        return self.state.own_trades.get(self.name, [])
-
-    def _get_order_depth(self):
-        order_depth = None
+    def _parse_book(self):
+        bids, asks = {}, {}
         try:
-            order_depth: OrderDepth = self.state.order_depths[self.name]
+            od   = self.state.order_depths[self.name]
+            bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(),  reverse=True)}
+            asks = {p: abs(v) for p, v in sorted(od.sell_orders.items())}
         except Exception:
             pass
-        buy_orders, sell_orders = {}, {}
-        try:
-            buy_orders  = {bp: abs(bv) for bp, bv in
-                           sorted(order_depth.buy_orders.items(),  key=lambda x: x[0], reverse=True)}
-            sell_orders = {sp: abs(sv) for sp, sv in
-                           sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
-        except Exception:
-            pass
-        return buy_orders, sell_orders
+        return bids, asks
 
-    def _get_max_allowed_volume(self):
-        return (self.position_limit - self.starting_position,
-                self.position_limit + self.starting_position)
+    def best_bid(self): return next(iter(self.bids), None)
+    def best_ask(self): return next(iter(self.asks), None)
+    def mid(self):
+        bb, ba = self.best_bid(), self.best_ask()
+        return (bb + ba) / 2.0 if bb is not None and ba is not None else None
 
-    def _get_take_margin(self):   return self.params.get("take_margin",  1)
-    def _get_clear_margin(self):  return self.params.get("clear_margin", 0)
-    def _get_make_margin(self):   return self.params.get("make_margin",  1)
-
-    def get_best_bid(self):
-        return next(iter(self.quoted_buy_orders),  None)
-    def get_best_ask(self):
-        return next(iter(self.quoted_sell_orders), None)
-
-    def buy(self, price, volume):
-        vol = min(round(abs(volume)), self.max_allowed_buy_volume)
-        self.max_allowed_buy_volume -= vol
+    def buy(self, price: float, volume: float):
+        vol = min(round(abs(volume)), self.max_buy)
+        if vol <= 0: return
+        self.max_buy -= vol           # only reduce buy capacity; don't touch sell
         self.orders.append(Order(self.name, round(price), vol))
-        self.expected_position += vol
 
-    def sell(self, price, volume):
-        vol = min(round(abs(volume)), self.max_allowed_sell_volume)
-        self.max_allowed_sell_volume -= vol
+    def sell(self, price: float, volume: float):
+        vol = min(round(abs(volume)), self.max_sell)
+        if vol <= 0: return
+        self.max_sell -= vol          # only reduce sell capacity; don't touch buy
         self.orders.append(Order(self.name, round(price), -vol))
-        self.expected_position -= vol
 
-    def update_traderData(self):
-        self.new_traderData["last_timestamp"] = self.timestamp
+    def ema(self, key: str, signal: Optional[float], alpha: float) -> Optional[float]:
+        """Generic EMA with state stored in new_td."""
+        prev = self.last_td.get(key)
+        if signal is None and prev is None: return None
+        value = signal if prev is None else (prev if signal is None
+                else alpha * signal + (1 - alpha) * prev)
+        self.new_td[key] = value
+        return value
 
-    def compute_mid_price(self):
-        bb, ba = self.get_best_bid(), self.get_best_ask()
-        if bb is not None and ba is not None:
-            return (bb + ba) / 2.0
+    def save_timestamp(self):
+        self.new_td["last_timestamp"] = self.timestamp
 
-    def compute_wall_mid(self):
-        def wall(book):
-            return max(book.items(), key=lambda x: x[1])[0] if book else None
-        wb = wall(self.quoted_buy_orders)
-        wa = wall(self.quoted_sell_orders)
-        if wb is not None and wa is not None:
-            return (wb + wa) / 2.0
-
-    def compute_microprice(self):
-        if self.quoted_sell_orders and self.quoted_buy_orders:
-            ba, bav = next(iter(self.quoted_sell_orders)), 0
-            bb, bbv = next(iter(self.quoted_buy_orders)),  0
-            bav = self.quoted_sell_orders[ba]
-            bbv = self.quoted_buy_orders[bb]
-            if bav + bbv == 0:
-                return None
-            return (ba * bbv + bb * bav) / (bav + bbv)
-
-    def compute_imbalance_price(self):
-        bb, ba = self.get_best_bid(), self.get_best_ask()
-        if bb is None or ba is None:
-            return self.compute_mid_price()
-        total_buy  = sum(self.quoted_buy_orders.values())
-        total_sell = sum(self.quoted_sell_orders.values())
-        total = total_buy + total_sell
-        if not total:
-            return self.compute_mid_price()
-        mid       = (ba + bb) / 2
-        spread    = ba - bb
-        imbalance = (total_buy - total_sell) / total
-        return mid + imbalance * (spread / 2)
-
-    def compute_vwap(self):
-        if not self.market_trades:
-            return None
-        num = sum(t.price * t.quantity for t in self.market_trades)
-        den = sum(t.quantity              for t in self.market_trades)
-        return num / den if den > 0 else None
-
-    def compute_ema(self, config_name):
-        cfg    = self.params["ema_configs"][config_name]
-        alpha  = cfg["alpha"]
-        source = cfg["source"]
-        signal = getattr(self, self._EMA_SOURCES[source])()
-        prev   = self.last_traderData.get(config_name)
-        if signal is None and prev is None:
-            return None
-        ema = signal if prev is None else (prev if signal is None
-              else alpha * signal + (1 - alpha) * prev)
-        self.new_traderData[config_name] = ema
-        return ema
-
-    def compute_make_ask_price(self):
-        fair_ask = self.fair_value + self.make_margin
-        if not self.quoted_sell_orders:
-            return fair_ask
-        best_ask = next(iter(self.quoted_sell_orders))
-        return best_ask - 1 if best_ask > fair_ask else fair_ask
-
-    def compute_make_bid_price(self):
-        fair_bid = self.fair_value - self.make_margin
-        if not self.quoted_buy_orders:
-            return fair_bid
-        best_bid = next(iter(self.quoted_buy_orders))
-        return best_bid + 1 if best_bid < fair_bid else fair_bid
-
-    def get_orders(self):
-        raise NotImplementedError
+    def result(self): return {self.name: self.orders}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PRODUCT TRADERS
+#  STATIC FAIR-VALUE TRADER  (HYDROGEL_PACK + VELVETFRUIT_EXTRACT)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class StaticFairValueTrader(ProductTrader):
+class StaticFVTrader(ProductTrader):
     """
-    Take/Clear/Make around a weighted (static_fv, EMA) fair value.
-    Used for HYDROGEL_PACK and VELVETFRUIT_EXTRACT.
+    Take/Clear/Make around a fair value that is either:
+      - a static constant weighted with an EMA of mid  (HYDROGEL)
+      - pure EMA of mid                                (underlying)
     """
-    def __init__(self, name, state, last_traderData, new_traderData):
-        super().__init__(name, state, last_traderData, new_traderData)
-        self.static_fv = self.params.get("static_fv")
-        weights = self.params.get("fv_method_weights", [1, 0])
-        total   = sum(weights)
-        self.w_static, self.w_ema = (weights[0]/total, weights[1]/total)
-        self.fair_value = self._compute_fair_value()
+    def __init__(self, name, state, last_td, new_td):
+        super().__init__(name, state, last_td, new_td)
+        alpha      = self.params["ema_alpha"]
+        static_fv  = self.params.get("static_fv")
+        mid_ema    = self.ema("mid_ema", self.mid(), alpha)
 
-    def _compute_fair_value(self):
-        ema = self.compute_ema("mid_ema")
-        if self.static_fv is None:
-            return round(ema) if ema else None
-        if ema is None:
-            return self.static_fv
-        return round(self.w_static * self.static_fv + self.w_ema * ema)
+        if static_fv is not None:
+            # HYDROGEL: weight 100% static (mean is very stable)
+            self.fv = static_fv if mid_ema is None else static_fv
+        else:
+            # Underlying: pure EMA
+            self.fv = mid_ema
+
+        self.take_w  = self.params["take_margin"]
+        self.clear_w = self.params["clear_margin"]
+        self.make_w  = self.params["make_margin"]
 
     def get_orders(self):
-        if self.fair_value is None:
-            return {self.name: []}
+        if self.fv is None:
+            return self.result()
 
-        # ── TAKE: hit bids above fair, lift asks below fair ──────────────────
-        for bp, bv in self.quoted_buy_orders.items():
-            if bp < self.fair_value + self.take_margin:
-                break
+        fv = self.fv
+        # ── TAKE ─────────────────────────────────────────────────────────────
+        # Hit bids that are too high (> fv + take_w → sell)
+        for bp, bv in self.bids.items():
+            edge = bp - fv
+            if edge < self.take_w: break
             self.sell(bp, bv)
+        # Lift asks that are too low (< fv - take_w → buy)
+        for ap, av in self.asks.items():
+            edge = fv - ap
+            if edge < self.take_w : break
+            self.buy(ap, av)
 
-        for sp, sv in self.quoted_sell_orders.items():
-            if sp > self.fair_value - self.take_margin:
-                break
-            self.buy(sp, sv)
-
-        # ── CLEAR: nudge position back toward zero at fair ───────────────────
-        pos_after = self.expected_position
+        # ── CLEAR: work position back toward zero ─────────────────────────────
+        pos_after = self.position + sum(
+            o.quantity for o in self.orders)
         if pos_after > 0:
-            self.sell(self.fair_value + self.clear_margin, pos_after)
+            self.sell(round(fv) + self.clear_w, pos_after)
         elif pos_after < 0:
-            self.buy(self.fair_value - self.clear_margin, -pos_after)
+            self.buy(round(fv) - self.clear_w, -pos_after)
 
-        # ── MAKE: passive quotes either side of fair ─────────────────────────
-        ask_price = self.compute_make_ask_price()
-        bid_price = self.compute_make_bid_price()
-        if self.max_allowed_sell_volume > 0:
-            self.sell(ask_price, self.max_allowed_sell_volume)
-        if self.max_allowed_buy_volume > 0:
-            self.buy(bid_price,  self.max_allowed_buy_volume)
+        # ── MAKE ─────────────────────────────────────────────────────────────
+        # Quote ask: undercut best ask if it's above fair_ask, else post at fair_ask
+        fair_ask = round(fv) + self.make_w
+        fair_bid = round(fv) - self.make_w
+        ba = self.best_ask()
+        bb = self.best_bid()
+        ask_price = (ba - 1) if (ba is not None and ba > fair_ask) else fair_ask
+        bid_price = (bb + 1) if (bb is not None and bb < fair_bid) else fair_bid
 
-        return {self.name: self.orders}
+        self.sell(ask_price, self.max_sell)
+        self.buy(bid_price,  self.max_buy)
+
+        return self.result()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  VEV OPTION TRADER  (Black-Scholes fair value with rolling IV)
+# ─────────────────────────────────────────────────────────────────────────────
 class VEVTrader(ProductTrader):
     """
-    Call-option trader for VEV_XXXX products.
+    Each tick:
+      1. Compute TTE from day_offset + timestamp.
+      2. Get implied vol from this option's market price → update rolling IV EMA.
+      3. Use rolling IV (or SIGMA_FALLBACK) as sigma.
+      4. BS fair value = bs_call(S, K, TTE, sigma).
+      5. Take/Clear/Make around BS fair.
 
-    Fair value = Black-Scholes call price using:
-      - S  = current VELVETFRUIT_EXTRACT mid price   (passed in from Trader.run)
-      - K  = option strike (from PARAMS)
-      - T  = time remaining to expiry in competition-days
-      - σ  = SIGMA  (calibrated from historical data)
-      - r  = 0
-
-    Strategy:
-      TAKE  — immediately snipe options mispriced by > take_margin ticks vs BS
-      CLEAR — reduce position at fair if we've accumulated inventory
-      MAKE  — passive quotes MAKE_MARGIN either side of BS fair value
+    The rolling IV makes the strategy adaptive:
+      - If the market is pricing vol higher (e.g. near expiry spike), we adapt.
+      - Prevents the "dead model on submission day" problem from P3 top teams.
     """
-    def __init__(self, name, state, last_traderData, new_traderData,
-                 underlying_mid: Optional[float], day_offset: int):
-        super().__init__(name, state, last_traderData, new_traderData)
+    def __init__(self, name: str, state: TradingState,
+                 last_td: dict, new_td: dict,
+                 underlying_mid: Optional[float],
+                 day_offset: int):
+        super().__init__(name, state, last_td, new_td)
 
-        self.strike          = self.params["strike"]
-        self.underlying_mid  = underlying_mid
-        self.day_offset      = day_offset
+        self.K   = self.params["strike"]
+        self.S   = underlying_mid
+        self.TTE = max(TTE_AT_R3_START - (day_offset + self.timestamp / 1_000_000), 0.0)
 
-        # Time remaining to expiry in competition-days
-        self.T_remaining = max(
-            EXPIRY_DAYS - (day_offset + self.timestamp / 1_000_000),
-            0.0
-        )
+        self.take_w  = self.params["take_margin"]
+        self.clear_w = self.params["clear_margin"]
+        self.make_w  = self.params["make_margin"]
 
-        # Compute BS fair value
-        self.fair_value = self._bs_fair_value()
+        # ── Update rolling implied vol ────────────────────────────────────────
+        mkt_mid = self.mid()
+        live_iv = None
+        if mkt_mid is not None and self.S is not None and self.TTE > 0:
+            live_iv = implied_vol(mkt_mid, self.S, self.K, self.TTE)
 
-    # ── Black-Scholes (uses only math/numpy — safe for competition) ──────────
-    @staticmethod
-    def _norm_cdf(x: float) -> float:
-        return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+        # EMA-smooth the IV; alpha=0.05 → ~20-tick memory
+        self.sigma = self.ema("rolling_iv", live_iv, alpha=0.05)
+        if self.sigma is None or self.sigma <= 0:
+            self.sigma = SIGMA_FALLBACK
 
-    def _bs_call(self, S, K, T, sigma) -> float:
-        if T <= 0 or sigma <= 0:
-            return max(S - K, 0.0)
-        d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-        d2 = d1 - sigma * math.sqrt(T)
-        return S * self._norm_cdf(d1) - K * self._norm_cdf(d2)
-
-    def _bs_delta(self, S, K, T, sigma) -> float:
-        """Delta = dC/dS.  Useful for hedging the underlying."""
-        if T <= 0 or sigma <= 0:
-            return 1.0 if S > K else 0.0
-        d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-        return self._norm_cdf(d1)
-
-    def _bs_fair_value(self) -> Optional[float]:
-        if self.underlying_mid is None or self.T_remaining <= 0:
-            # At expiry: intrinsic value only
-            if self.underlying_mid is not None:
-                return max(self.underlying_mid - self.strike, 0.0)
-            return None
-        return self._bs_call(self.underlying_mid, self.strike,
-                              self.T_remaining, SIGMA)
+        # ── BS fair value ─────────────────────────────────────────────────────
+        if self.S is not None and self.TTE > 0:
+            self.fv = bs_call(self.S, self.K, self.TTE, self.sigma)
+        elif self.S is not None:
+            self.fv = max(self.S - self.K, 0.0)   # at expiry: intrinsic only
+        else:
+            self.fv = None
 
     def get_orders(self):
-        if self.fair_value is None:
-            return {self.name: []}
+        if self.fv is None:
+            return self.result()
 
-        fv = self.fair_value
+        fv = max(self.fv, 1.0)   # ensure fair value is positive (for options, and just in case)
+
+        if fv < 5:
+            take_w = 1
+            clear_w = 1
+            make_w = 1
+        
+        else:
+            take_w  = self.params["take_margin"]
+            clear_w = self.params["clear_margin"]
+            make_w  = self.params["make_margin"]
 
         # ── TAKE ─────────────────────────────────────────────────────────────
-        # Lift cheap asks (market price < BS fair - margin → option is cheap, BUY)
-        for sp, sv in self.quoted_sell_orders.items():
-            if sp > fv - self.take_margin:
-                break
-            self.buy(sp, sv)
-
-        # Hit expensive bids (market price > BS fair + margin → option is dear, SELL)
-        for bp, bv in self.quoted_buy_orders.items():
-            if bp < fv + self.take_margin:
-                break
+        # Option looks cheap → BUY (lift ask below fair - take_w)
+        for ap, av in self.asks.items():
+            if ap > fv*0.8: break
+            self.buy(ap, av)
+        # Option looks expensive → SELL (hit bid above fair + take_w)
+        for bp, bv in self.bids.items():
+            if bp < fv * 1.2: break
             self.sell(bp, bv)
 
         # ── CLEAR ─────────────────────────────────────────────────────────────
-        pos_after = self.expected_position
+        pos_after = self.position + sum(o.quantity for o in self.orders)
         if pos_after > 0:
-            self.sell(round(fv) + self.clear_margin, pos_after)
+            self.sell(round(fv) + clear_w, pos_after)
         elif pos_after < 0:
-            self.buy(round(fv)  - self.clear_margin, -pos_after)
+            self.buy(round(fv) - clear_w, -pos_after)
 
         # ── MAKE ─────────────────────────────────────────────────────────────
-        ask_price = self.compute_make_ask_price()
-        bid_price = self.compute_make_bid_price()
-        if self.max_allowed_sell_volume > 0:
-            self.sell(ask_price, self.max_allowed_sell_volume)
-        if self.max_allowed_buy_volume > 0:
-            self.buy(bid_price,  self.max_allowed_buy_volume)
+        fair_ask  = round(fv) + make_w
+        fair_bid  = round(fv) - make_w
+        ba = self.best_ask(); bb = self.best_bid()
+        ask_price = (ba - 1) if (ba is not None and ba > fair_ask) else fair_ask
+        bid_price = (bb + 1) if (bb is not None and bb < fair_bid) else fair_bid
 
-        return {self.name: self.orders}
+        self.sell(ask_price, self.max_sell)
+        self.buy(bid_price,  self.max_buy)
 
-    # Override so compute_make_xxx use self.fair_value (already set)
-    def compute_make_ask_price(self):
-        fv = self.fair_value
-        fair_ask = fv + self.make_margin
-        if not self.quoted_sell_orders:
-            return fair_ask
-        best_ask = next(iter(self.quoted_sell_orders))
-        return best_ask - 1 if best_ask > fair_ask else fair_ask
-
-    def compute_make_bid_price(self):
-        fv = self.fair_value
-        fair_bid = fv - self.make_margin
-        if not self.quoted_buy_orders:
-            return fair_bid
-        best_bid = next(iter(self.quoted_buy_orders))
-        return best_bid + 1 if best_bid < fair_bid else fair_bid
+        return self.result()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,34 +346,29 @@ class VEVTrader(ProductTrader):
 # ─────────────────────────────────────────────────────────────────────────────
 class Trader:
     """
-    Orchestrates all product traders each tick.
+    Execution order each tick:
+      1. Load traderData; determine day_offset (0,1,2 across the 3 days).
+      2. Read VELVETFRUIT_EXTRACT mid → passed to all VEV traders.
+      3. Run StaticFVTrader for VELVETFRUIT_EXTRACT and HYDROGEL_PACK.
+      4. Run VEVTrader for each of the 10 option strikes.
+      5. Encode and return traderData.
 
-    Execution order each timestep:
-      1. Decode traderData from last tick
-      2. Determine day_offset (which competition-day we're on)
-      3. Read VELVETFRUIT_EXTRACT mid price  →  feeds all VEV option traders
-      4. Run StaticFairValueTrader for HYDROGEL_PACK and VELVETFRUIT_EXTRACT
-      5. Run VEVTrader for each option
-      6. Encode and return traderData
+    day_offset: increments each time timestamp wraps back to 0,
+    i.e. day_offset=0 on Day 1 of Round 3, =1 on Day 2, =2 on Day 3.
     """
 
-    def _get_day_offset(self, state: TradingState, last_td: dict) -> int:
-        """
-        Infer which competition day we're on.
-        day_offset increments each time timestamp wraps back to 0.
-        """
-        last_ts     = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
-        day_offset  = last_td.get("_meta", {}).get("day_offset", 0)
+    def _day_offset(self, state: TradingState, last_td: dict) -> int:
+        last_ts    = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
+        day_offset = last_td.get("_meta", {}).get("day_offset", 0)
         if state.timestamp < last_ts:   # timestamp wrapped → new day
             day_offset += 1
         return day_offset
 
-    def _get_underlying_mid(self, state: TradingState) -> Optional[float]:
-        """Read VELVETFRUIT_EXTRACT mid price from the order book."""
+    def _underlying_mid(self, state: TradingState) -> Optional[float]:
         try:
-            od  = state.order_depths["VELVETFRUIT_EXTRACT"]
-            bb  = max(od.buy_orders.keys())
-            ba  = min(od.sell_orders.keys())
+            od = state.order_depths["VELVETFRUIT_EXTRACT"]
+            bb = max(od.buy_orders.keys())
+            ba = min(od.sell_orders.keys())
             return (bb + ba) / 2.0
         except Exception:
             return None
@@ -447,48 +376,36 @@ class Trader:
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
 
-        # ── 1. Load state ─────────────────────────────────────────────────────
-        last_traderData = (jsonpickle.decode(state.traderData)
-                           if state.traderData else default_traderData())
-        new_traderData  = default_traderData()
-        new_traderData.setdefault("_meta", {})
+        # ── Load state ────────────────────────────────────────────────────────
+        last_td = jsonpickle.decode(state.traderData) if state.traderData else default_traderData()
+        new_td  = default_traderData()
 
-        # ── 2. Day tracking ───────────────────────────────────────────────────
-        day_offset = self._get_day_offset(state, last_traderData)
-        new_traderData["_meta"]["day_offset"]    = day_offset
-        new_traderData["_meta"]["last_timestamp"] = state.timestamp
+        # ── Day tracking ──────────────────────────────────────────────────────
+        day_offset = self._day_offset(state, last_td)
+        new_td["_meta"]["day_offset"]    = day_offset
+        new_td["_meta"]["last_timestamp"] = state.timestamp
 
-        T_remaining = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
-        print(f"[{state.timestamp}] day_offset={day_offset}  T_remaining={T_remaining:.4f}")
+        tte = max(TTE_AT_R3_START - (day_offset + state.timestamp / 1_000_000), 0.0)
+        print(f"[t={state.timestamp}] day_offset={day_offset}  TTE={tte:.4f}")
 
-        # ── 3. Underlying mid price ───────────────────────────────────────────
-        underlying_mid = self._get_underlying_mid(state)
+        # ── Underlying mid price (needed by all VEV traders) ──────────────────
+        S = self._underlying_mid(state)
 
-        # ── 4. VELVETFRUIT_EXTRACT — market-make the underlying itself ────────
-        vfe_trader = StaticFairValueTrader(
-            "VELVETFRUIT_EXTRACT", state, last_traderData, new_traderData
-        )
-        result.update(vfe_trader.get_orders())
-        vfe_trader.update_traderData()
+        # ── VELVETFRUIT_EXTRACT ───────────────────────────────────────────────
+        # Disabled because it is strongly negative in backtest
+        new_td["VELVETFRUIT_EXTRACT"] = last_td.get("VELVETFRUIT_EXTRACT", {})
 
-        # ── 5. HYDROGEL_PACK — mean-reversion market-making ──────────────────
-        hyd_trader = StaticFairValueTrader(
-            "HYDROGEL_PACK", state, last_traderData, new_traderData
-        )
-        result.update(hyd_trader.get_orders())
-        hyd_trader.update_traderData()
+        # ── HYDROGEL_PACK ─────────────────────────────────────────────────────
+        hyd = StaticFVTrader("HYDROGEL_PACK", state, last_td, new_td)
+        result.update(hyd.get_orders())
+        hyd.save_timestamp()
 
-        # ── 6. VEV options — Black-Scholes fair value ─────────────────────────
+        # ── VEV options (10 strikes) ──────────────────────────────────────────
         for k in STRIKES:
-            name   = f"VEV_{k}"
-            trader = VEVTrader(
-                name, state, last_traderData, new_traderData,
-                underlying_mid=underlying_mid,
-                day_offset=day_offset,
-            )
-            result.update(trader.get_orders())
-            trader.update_traderData()
+            vev = VEVTrader(f"VEV_{k}", state, last_td, new_td,
+                            underlying_mid=S, day_offset=day_offset)
+            result.update(vev.get_orders())
+            vev.save_timestamp()
 
-        # ── 7. Save state ─────────────────────────────────────────────────────
-        traderData = jsonpickle.encode(new_traderData)
-        return result, 0, traderData
+        # ── Return ────────────────────────────────────────────────────────────
+        return result, 0, jsonpickle.encode(new_td)
