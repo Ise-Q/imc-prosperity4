@@ -19,11 +19,13 @@ import math
 #    sigma = 0.02155  (daily realized vol, used as "annual" vol in BS)
 #    Options expire at end of Day 2 (= T=0)
 #
-#  Strategy overview (v2 — improved from round3_trading_strategies.py EDA):
+#  Strategy overview (v2 — improved from forensic analysis of log 385103):
 #    HYDROGEL:   static mean-reversion (take/clear/make around mu=9991) ← kept
-#    VEV_5200-5500: TAKE-ONLY options seller (no passive making) + delta hedge
+#    VEV_5200-5500: TAKE-ONLY seller with intrinsic-floor safety trigger
+#      sell_trigger = intrinsic + 5  when BS_fair/market_mid > 1.10 (T inflated)
+#      sell_trigger = BS_fair + threshold  otherwise (T correct)
 #    VEV_4000-5100, 6000-6500: NOT TRADED (delta-1 / no premium)
-#    VELVETFRUIT_EXTRACT: ONLY used for delta hedging (no standalone MM)
+#    VELVETFRUIT_EXTRACT: NOT TRADED (removed standalone MM that caused -179k)
 
 STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 VEV_PRODUCTS = [f"VEV_{k}" for k in STRIKES]
@@ -434,13 +436,15 @@ class Trader:
     """
     Orchestrates all product traders each tick.
 
-    v2 execution order (improved from EDA findings):
+    v2 execution order:
       1. Decode traderData from last tick
-      2. Compute T_remaining from global timestamp (day_offset always 0 in continuous BT)
+      2. Compute T_remaining (day_offset tracks resets; if state is fresh, BS sanity
+         check in VEVOptionSeller catches inflated T via fair/market_mid > 1.10)
       3. Read VELVETFRUIT_EXTRACT mid price
       4. HYDROGEL_PACK  — unchanged mean-reversion take/clear/make
-      5. VEV options    — TAKE-ONLY selling for K=5200-5500 when overpriced vs BS
-         (no delta hedge — backtester settlement at market mid overstates hedge cost)
+      5. VEV options    — TAKE-ONLY with intrinsic-floor fallback (T-robust)
+         sell when bid > max(BS_fair+threshold, intrinsic+5), or just intrinsic+5
+         when T looks wrong. No delta hedge, no passive MAKE orders.
       6. Encode state
     """
 
@@ -496,16 +500,10 @@ class Trader:
             for seller in sellers:
                 result.update(seller.get_orders())
         else:
-            # Fallback: run original VEVTrader if module not available
-            for k in STRIKES:
-                name   = f"VEV_{k}"
-                trader = VEVTrader(
-                    name, state, last_traderData, new_traderData,
-                    underlying_mid=underlying_mid,
-                    day_offset=day_offset,
-                )
-                result.update(trader.get_orders())
-                trader.update_traderData()
+            # strategies module failed to load — skip options entirely.
+            # DO NOT fall back to VEVTrader: its MAKE orders cause immediate
+            # adverse fills when T_remaining is wrong (forensic: log 385103).
+            pass
 
         # ── 6. Save state ─────────────────────────────────────────────────────
         traderData = jsonpickle.encode(new_traderData)

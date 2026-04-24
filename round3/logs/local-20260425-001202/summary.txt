@@ -1,0 +1,75 @@
+[run_backtest] summary:
+  final timestamp : 999900
+  total PnL       : +4954.0
+
+  HYDROGEL_PACK
+    PnL              +5279.0
+    trades taken     142 (buy 67 / sell 75)   missed 345   participation 29.2%
+    avg buy edge     +5.55   avg sell edge +3.26
+    avg pos          -5.99   final pos -50
+
+  VELVETFRUIT_EXTRACT
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 450   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_4000
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 164   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_4500
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 1   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_5000
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 1   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_5100
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 1   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_5200
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 7   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_5300
+    PnL              -300.0
+    trades taken     3 (buy 0 / sell 3)   missed 39   participation 7.1%
+    avg buy edge     n/a   avg sell edge -0.91
+    avg pos          -50.00   final pos -50
+
+  VEV_5400
+    PnL              -75.0
+    trades taken     4 (buy 0 / sell 4)   missed 81   participation 4.7%
+    avg buy edge     n/a   avg sell edge +0.35
+    avg pos          -74.99   final pos -75
+
+  VEV_5500
+    PnL              +50.0
+    trades taken     5 (buy 0 / sell 5)   missed 92   participation 5.2%
+    avg buy edge     n/a   avg sell edge +0.43
+    avg pos          -99.98   final pos -100
+
+  VEV_6000
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 98   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0
+
+  VEV_6500
+    PnL              +0.0
+    trades taken     0 (buy 0 / sell 0)   missed 98   participation 0.0%
+    avg buy edge     n/a   avg sell edge n/a
+    avg pos          +0.00   final pos +0

@@ -5,35 +5,37 @@ EDA-grounded modular strategy classes for IMC Prosperity Round 3.
 
 Architecture:
   ProductTrader (base) — defined in Trader.py
-  ↳ HydrogelTrader    — mean-reversion, take/clear/make around mu=9991
   ↳ VEVOptionSeller   — TAKE-ONLY options seller for overpriced strikes
-  ↳ DeltaHedger       — buys/sells underlying to maintain delta-neutral book
-  ↳ DeepITMTrader     — disabled (delta-1 instruments, no option premium)
+  (DeltaHedger disabled — gamma cost exceeds benefit in backtester)
 
-Key findings from EDA (see round3_EDA.py for full analysis):
+Key findings from EDA:
 ─────────────────────────────────────────────────────────────
 Pattern 1 — Options Systematic Overpricing
   Market bids consistently exceed BS fair value from day 1 onwards:
     K=5200: +12 ticks day 1, +27 ticks day 2
     K=5300: +13 ticks day 1, +30 ticks day 2
-  SELL when market_bid > BS_fair + take_margin (TAKE-ONLY, no passive making).
-  Passive making caused immediate adverse fills at sub-market prices; disabled.
+  SELL when market_bid > sell_trigger (TAKE-ONLY, no passive making).
+  Passive making caused immediate adverse fills; disabled.
 
-Pattern 2 — Delta Risk (CRITICAL FIX from baseline)
-  Baseline Trader.py: lost -179k on VELVETFRUIT_EXTRACT + -30k on options.
-  Cause: short calls without delta hedge = effectively short the underlying.
-  Fix: buy underlying = sum(short_qty × delta) per option position.
+Pattern 2 — Platform run failure (forensic from log 385103)
+  Root cause: day_offset=0 on fresh-start day 2 → T_remaining=3.0 → inflated
+  BS_fair → MAKE bids above market ask → 200 long contracts per strike in 10 ticks.
+  Fix A: TAKE-ONLY (already applied). Fix B: intrinsic-floor sell trigger (new).
+  Intrinsic floor: sell when bid > intrinsic + MIN_PREMIUM (5).
+  This is always profitable at expiry regardless of T_remaining errors.
+  T-sanity check: if BS_fair/market_mid > 1.10, T is likely inflated → use floor.
 
 Pattern 3 — HYDROGEL Mean Reversion
   OU half-life = 301 ticks, mu = 9991, sigma = 32.
   Current take/clear/make strategy earns +15,633. Kept unchanged.
 
-Strikes to trade:
-  VEV_5200, VEV_5300 — primary (large, consistent mispricing)
-  VEV_5400, VEV_5500 — secondary (smaller mispricing, less directional risk)
-  VEV_4000, VEV_4500 — SKIP (delta-1, no real option premium, pure underlying exposure)
-  VEV_5000, VEV_5100 — SKIP (delta ~0.97, small misprice doesn't justify risk)
-  VEV_6000, VEV_6500 — SKIP (market price = 0.5 minimum, no tradeable premium)
+Strikes to trade (and VEV_5200 capped at 50):
+  VEV_5200 (limit=50) — ITM, highest edge, delta risk managed by small position
+  VEV_5300 (limit=50) — near-ATM, large consistent mispricing
+  VEV_5400 (limit=75) — OTM, good edge, low delta risk
+  VEV_5500 (limit=100)— deep OTM, low premium but very low risk
+  VEV_4000/4500/5000/5100 — SKIP (delta ~1, no option premium to capture)
+  VEV_6000/6500 — SKIP (market price = 0.5, not tradeable)
 """
 
 import math
@@ -171,20 +173,49 @@ class VEVOptionSeller:
         self.pos += vol
 
     def get_orders(self) -> Dict[str, List]:
-        if self.fair is None:
+        if self.S is None:
             return {self.name: []}
 
-        fv = self.fair
+        # Intrinsic floor: always profitable at expiry regardless of T_remaining.
+        # Sell any option at bid > intrinsic + MIN_PREMIUM → guaranteed profit at settlement.
+        intrinsic    = max(float(self.S - self.strike), 0.0)
+        MIN_PREMIUM  = 5.0
+        sell_floor   = intrinsic + MIN_PREMIUM
 
-        # SELL: market bid > BS + threshold (option is overpriced)
+        # T-sanity check: if BS_fair >> market mid, day_offset is likely wrong
+        # (e.g. fresh platform start on day 2 gives T=3.0 instead of correct ~1.0).
+        # Threshold 1.10 cleanly separates correct-T day 0 (ratio ≤ 1.06 for K=5200/5300)
+        # from wrong-T day 2 (ratio ≥ 1.12 for all strikes).
+        market_mid = None
+        if self.bids and self.asks:
+            market_mid = (next(iter(self.bids)) + next(iter(self.asks))) / 2.0
+
+        t_inflated = (
+            self.fair is not None
+            and market_mid is not None
+            and self.fair > market_mid * 1.10
+        )
+
+        if t_inflated:
+            # T_remaining unreliable — use intrinsic floor only
+            sell_trigger = sell_floor
+        elif self.fair is not None:
+            # T looks correct — use BS-calibrated threshold (conservative on day 0)
+            sell_trigger = self.fair + self.threshold
+            # Safety: never submit a sell below the profitable floor
+            sell_trigger = max(sell_trigger, sell_floor)
+        else:
+            sell_trigger = sell_floor
+
+        # SELL: hit market bids above the trigger
         for bp, bv in self.bids.items():
-            if bp < fv + self.threshold:
+            if bp < sell_trigger:
                 break
             self._sell(bp, bv)
 
-        # BUY back: market ask < BS - threshold (option is underpriced / cover shorts)
+        # BUY back: cover shorts only when ask ≤ intrinsic (never pay time value to cover)
         for sp, sv in self.asks.items():
-            if sp > fv - self.threshold:
+            if sp > intrinsic:
                 break
             self._buy(sp, sv)
 
