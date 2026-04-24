@@ -1,0 +1,17 @@
+No-Arbitrage Violation Summary (fraction of aligned ticks)
+
+Monotonicity C(K↑) non-increasing : violation rate = 0.0000%
+Convexity C(K1)-2C(K2)+C(K3) ≥ 0   : violation rate = 0.0300%
+
+Voucher         K     C < max(S-K,0)      C > S
+───────────────────────────────────────────────────────
+VEV_4000     4000           9.9533%   0.0000%
+VEV_4500     4500          29.3733%   0.0000%
+VEV_5000     5000           0.0100%   0.0000%
+VEV_5100     5100           0.0000%   0.0000%
+VEV_5200     5200           0.0000%   0.0000%
+VEV_5300     5300           0.0000%   0.0000%
+VEV_5400     5400           0.0000%   0.0000%
+VEV_5500     5500           0.0000%   0.0000%
+VEV_6000     6000           0.0000%   0.0000%
+VEV_6500     6500           0.0000%   0.0000%
