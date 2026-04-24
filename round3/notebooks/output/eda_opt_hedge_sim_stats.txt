@@ -1,8 +1,0 @@
-Delta-hedge simulation (VEV_5300, short Δ·VEE, no costs)
-
-Ticks simulated : 29,999
-Final P&L naked :      +5.00
-Final P&L hedged:      -7.39
-Std naked       :    +0.4962
-Std hedged      :    +0.3887
-Var reduction   :     +38.65%

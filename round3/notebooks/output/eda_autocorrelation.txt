@@ -1,6 +1,0 @@
-Residual Mean-Reversion Test (lag-1 autocorrelation of mid − rolling_mid)
-
-Product                        AC(1)       Interpretation
-────────────────────────────────────────────────────────────
-HYDROGEL_PACK                -0.0253          random walk
-VELVETFRUIT_EXTRACT          -0.0578          random walk

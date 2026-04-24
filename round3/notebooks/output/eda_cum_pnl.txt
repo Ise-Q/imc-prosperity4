@@ -1,5 +1,0 @@
-Final cumulative PnL per day:
-Product                        Day 0      Day 1      Day 2
-──────────────────────────────────────────────────────────
-HYDROGEL_PACK                   +0.0       +0.0       +0.0
-VELVETFRUIT_EXTRACT             +0.0       +0.0       +0.0

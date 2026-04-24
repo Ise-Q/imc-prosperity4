@@ -1,4 +1,0 @@
-Product                      Avg Bid    Avg Ask    Avg Imb
-────────────────────────────────────────────────────────────
-HYDROGEL_PACK                   37.6       37.6    -0.0001
-VELVETFRUIT_EXTRACT             60.4       60.4    -0.0000
