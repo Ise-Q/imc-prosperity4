@@ -39,7 +39,7 @@ POS_LIMITS = {
 
 # Options BS parameters (from analysis.py)
 SIGMA        = 0.02155   # calibrated realized vol
-EXPIRY_DAYS  = 3.0       # options expire end of Day 2
+EXPIRY_DAYS  = 3.0       # 3 data days (0,1,2); offset 0→2; T=EXPIRY_DAYS-(offset+ts/1e6)
 RISK_FREE    = 0.0
 
 PARAMS = {

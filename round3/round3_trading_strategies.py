@@ -66,7 +66,7 @@ def bs_delta(S: float, K: float, T: float, sigma: float) -> float:
 # ── Strategy parameters ───────────────────────────────────────────────────────
 
 SIGMA        = 0.02155   # calibrated realized volatility (comp-annual)
-EXPIRY_DAYS  = 3.0       # options expire at end of Day 2
+EXPIRY_DAYS  = 3.0       # 3 data days (0,1,2); T_remaining is passed in from Trader.py
 
 # Strikes we will actively trade (sell)
 SELL_STRIKES = [5200, 5300, 5400, 5500]
