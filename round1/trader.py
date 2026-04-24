@@ -1,114 +1,329 @@
-# Submission UUID: (save after uploading to Prosperity)
-#
-# Strategy summary:
-#   ASH_COATED_OSMIUM    — static fair value 10000 (CV=0.054%, extremely stable)
-#   INTARIAN_PEPPER_ROOT — adaptive fair value via 10-tick rolling mid price
-#
-#   Both products:
-#     1. Market-take: hit bot sell orders below FV (buy cheap)
-#                     hit bot buy  orders above FV (sell dear)
-#     2. Market-make: post buy at FV-1, sell at FV+1 (inside the ~13-16 tick bot spread)
-#
-# !! VERIFY position limits on Prosperity platform before submitting !!
-
-from datamodel import OrderDepth, TradingState, Order, UserId
-from typing import List, Dict
+from datamodel import OrderDepth, TradingState, Order
+from typing import Dict, List
 import jsonpickle
+import numpy as np
 
-# Per-product absolute position limits.  Verify these on the Prosperity platform.
-POSITION_LIMITS: Dict[str, int] = {
-    "ASH_COATED_OSMIUM": 20,
-    "INTARIAN_PEPPER_ROOT": 20,
+
+# ASH: EMA(alpha = 0.05) fair value + take/clear/make | IPR: buy-and-hold
+
+PRODUCTS = ["INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM"]
+POS_LIMITS = {
+    'ASH_COATED_OSMIUM': 80,
+    "INTARIAN_PEPPER_ROOT": 80
+}
+PARAMS = {
+    "ASH_COATED_OSMIUM": {
+      "ema_alpha": 0.05,
+      "take_margin": 1,
+      "clear_margin": 6, "make_margin": 4
+    },
+    "INTARIAN_PEPPER_ROOT":{
+        "slope": 0.001, "intercept": 12000.0,
+        "take_margin": 1, "clear_margin": 2,
+        "make_margin": 2
+    }
 }
 
-# ASH has an essentially fixed fair value (price never left 9977-10023 across 3 days).
-ASH_FAIR_VALUE = 10000
+# define default traderData
+def default_traderData():
+    # need to fillin
+    return {product: {} for product in PRODUCTS}
 
-# Rolling window for IPR fair value (short window tracks the within-day random walk).
-IPR_WINDOW = 10
+# base ProductTrader
+class ProductTrader:
+    def __init__(self, name, state, new_traderData):
+        self.orders = []
+        self.name = name
+        self.state = state
+        self.timestamp = self.state.timestamp
+        self.new_traderData = new_traderData
 
-# Max units to post on each side of the market when market-making.
-MM_SIZE = 10
+        self.last_traderData = self._get_last_traderData()
+        self.position_limit = POS_LIMITS.get(name, 0) # default to limit = 0 if prod not found in dict
 
+        self.starting_position = self._get_current_position()
+        self.expected_position = self.starting_position # to be updated (mutatable)
+
+        self.quoted_buy_orders, self.quoted_sell_orders = self._get_order_depth()
+
+        self.max_allowed_buy_volume, self.max_allowed_sell_volume = self._get_max_allowed_volume()
+
+        self.take_margin = self._get_take_margin()
+        self.clear_margin = self._get_clear_margin()
+        self.make_margin = self._get_make_margin()
+
+
+    def _get_last_traderData(self):
+        if self.state.traderData and self.state.traderData != "":
+            try:
+                last_traderData = jsonpickle.decode(self.state.traderData)
+            except Exception:
+                # corrupt data -- reset cleanly
+                last_traderData = default_traderData() # TODO
+            return last_traderData
+        else:
+            return default_traderData()
+
+    def _get_current_position(self):
+        return self.state.position.get(self.name, 0)
+
+    def _get_order_depth(self):
+        """
+        unravel order_depths into {price:order} object for each side of the orderbook.
+        We normalize so that order quantity is always POSITIVE.
+        """
+        order_depth = None
+        try:
+            order_depth : OrderDepth = self.state.order_depths[self.name]
+        except Exception:
+            pass
+
+        buy_orders, sell_orders = {}, {}
+        try:
+            buy_orders = {bp : abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key = lambda x: x[0], reverse=True)}
+            sell_orders ={sp : abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key = lambda x: x[0])}
+        except Exception:
+            pass
+
+        return buy_orders, sell_orders
+
+    def _get_max_allowed_volume(self):
+        max_allowed_buy_volume = self.position_limit - self.starting_position
+        max_allowed_sell_volume = self.position_limit + self.starting_position
+
+        return max_allowed_buy_volume, max_allowed_sell_volume
+
+    # define generic lookups for margins, but we can override them by redefining them in inherited classes
+    def _get_take_margin(self):
+        return PARAMS.get(self.name, {}).get("take_margin", 1)
+
+    def _get_clear_margin(self):
+        return PARAMS.get(self.name, {}).get("clear_margin",0)
+
+    def _get_make_margin(self):
+        return PARAMS.get(self.name, {}).get("make_margin",1)
+
+    def get_best_bid(self):
+        if self.quoted_buy_orders:
+            return next(iter(self.quoted_buy_orders))
+
+
+    def get_best_ask(self):
+        if self.quoted_sell_orders:
+            return next(iter(self.quoted_sell_orders))
+
+    def buy(self, price, volume):
+        """
+        Take in intended buy order (price and volume).
+        Append a buy order that respects exchange's requirements, mainly:
+            1. respect position limits
+            2. is an Order object (price and volume must be ints)
+        """
+        abs_volume = min(int(abs(volume)), self.max_allowed_buy_volume)
+        # update allowed buy volume
+        self.max_allowed_buy_volume -= abs_volume
+        order = Order(self.name, int(price), abs_volume)
+        self.orders.append(order)
+
+        # update expected position
+        self.expected_position += abs_volume
+
+    def sell(self, price, volume):
+        """
+        Take in intended sell order (price and volume).
+        Append a sell order that respects exchange's requirements, mainly:
+            1. respect position limits
+            2. is an Order object (price and volume must be ints)
+        """
+        abs_volume = min(int(abs(volume)), self.max_allowed_sell_volume)
+        # update allowed sell volume
+        self.max_allowed_sell_volume -= abs_volume
+        order = Order(self.name, int(price), -abs_volume)
+        self.orders.append(order)
+
+        # updated expected position
+        self.expected_position -= abs_volume
+
+    def update_traderData(self):
+        self.new_traderData[self.name]["last_timestamp"] = self.timestamp
+
+
+    def compute_mid_price(self):
+        bb = self.get_best_bid()
+        bo = self.get_best_ask()
+
+        if bb and bo:
+            return (bb + bo) / 2.0
+
+    def compute_wall_mid(self):
+        pass
+
+    def compute_VWAP(self):
+        pass
+
+    def compute_make_ask_price(self):
+        fair_ask_price = self.fair_value + self.make_margin
+        if not self.quoted_sell_orders:
+            return fair_ask_price
+        best_ask_price = next(iter(self.quoted_sell_orders)) # take lowest sell price with active volume (>1)
+
+        if best_ask_price > fair_ask_price:
+            # if ba > fair_ask, we undercut it by 1 price tick
+            return best_ask_price - 1
+        else:
+            return fair_ask_price
+
+    def compute_make_bid_price(self):
+        fair_bid_price = self.fair_value - self.make_margin
+        if not self.quoted_buy_orders:
+            return fair_bid_price
+        best_bid_price = next(iter(self.quoted_buy_orders)) # take highest bid price with active volume (>1)
+
+        if best_bid_price < fair_bid_price:
+            # if bb < fair_bid, we overbid bb by 1 price tick
+            return best_bid_price + 1
+        else:
+            return fair_bid_price
+
+
+class EMATrader(ProductTrader):
+    def __init__(self, state, new_traderData):
+        super().__init__("ASH_COATED_OSMIUM", state, new_traderData)
+        self.ema_alpha = PARAMS[self.name]["ema_alpha"]
+        self.fair_value = self.compute_fair_value()
+
+    def compute_fair_value(self):
+        """
+        EMA of mid-price as dynamic fair value.
+        Persists EMA state across ticks via traderData.
+        Falls back to 10000 if no order book available.
+        """
+        mid = self.compute_mid_price()
+        prev_ema = self.last_traderData[self.name].get("ema", None)
+
+        if mid is None:
+            # no order book — carry forward last EMA or default
+            ema = prev_ema if prev_ema is not None else 10000
+        elif prev_ema is None:
+            # first tick — initialize EMA with mid
+            ema = mid
+        else:
+            ema = self.ema_alpha * mid + (1 - self.ema_alpha) * prev_ema
+
+        self.new_traderData[self.name]["ema"] = ema
+        return round(ema)
+
+    def get_orders(self):
+        """
+        Take and Make.L
+        """
+        # STEP 1: take mispriced orders first
+        for bp, bv in self.quoted_buy_orders.items():
+            if bp < self.fair_value + self.take_margin:
+                break # buy_orders are in decreasing order. If first bp is smaller, rest are all smaller. break for faster run
+            # hit bid
+            self.sell(bp, bv)
+        for sp, sv in self.quoted_sell_orders.items():
+            if sp > self.fair_value - self.take_margin:
+                break
+            # lift offer
+            self.buy(sp, sv)
+
+        # STEP 2: Make orders
+        ask_price = self.compute_make_ask_price()
+        bid_price = self.compute_make_bid_price()   
+
+        # default: don't care about inventory as of now, change later
+        if ask_price is not None and self.max_allowed_sell_volume > 0:
+            self.sell(ask_price, self.max_allowed_sell_volume)
+        if bid_price is not None and self.max_allowed_buy_volume > 0:
+            self.buy(bid_price, self.max_allowed_buy_volume)
+
+
+        return {self.name : self.orders}
+
+
+
+class LinearTrendTrader(ProductTrader):
+    def __init__(self, state, new_traderData):
+        super().__init__("INTARIAN_PEPPER_ROOT", state, new_traderData)
+        self.alpha = PARAMS[self.name]["intercept"]
+        self.beta = PARAMS[self.name]["slope"]
+        self.fair_value = self.compute_fair_value()
+
+    def compute_fair_value(self):
+        """
+        fair value is a linear relationship with respect global time index
+        fair = alpha + beta * g_time_index
+        where
+            g_time_index = day_offset * 1e6 + timestamp
+
+        we reverse engineer day_offset at first iteration and save it in traderData
+        """
+        day_offset = self.last_traderData[self.name].get("day_offset", None)
+        if (day_offset is None):
+            # if day offset is not included in trader data, we reverse engineer by using mid price
+            day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
+
+            g_time_index = day_offset * 1_000_000 + self.timestamp
+            fair = self.alpha + self.beta * g_time_index
+
+            # update trader data
+            self.new_traderData[self.name]["day_offset"] = day_offset
+
+        else:
+            # if day offset is in traderData, use it to compute fair
+            # first check if we should use a new day_offset
+            if self.timestamp < self.last_traderData[self.name]["last_timestamp"]:
+                day_offset += 1 # increment day_offset by 1
+
+
+            g_time_index = day_offset * 1_000_000 + self.timestamp
+            fair = self.alpha + self.beta * g_time_index
+            # update day offset
+            self.new_traderData[self.name]["day_offset"] = day_offset
+        return round(fair)
+
+
+    def get_orders(self):
+        """
+        buy-hold
+        """
+
+        # buy at aggressive prices
+        if self.quoted_sell_orders:
+            agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
+            self.buy(agg_sp, self.position_limit)
+
+
+        return {self.name : self.orders}
 
 class Trader:
-
-    def bid(self):
-        """Required stub for Round 2; harmless in all other rounds."""
-        return 15
-
     def run(self, state: TradingState):
-        saved = (
-            jsonpickle.decode(state.traderData)
-            if state.traderData
-            else {"price_history": {}}
-        )
+        result : Dict[str, List[Order]] = {}
+        # STEP 1:intiialize new traderdata
+        new_traderData = default_traderData()
 
-        result: Dict[str, List[Order]] = {}
+        # STEP 2: intialize trader classes
+        ema_trader = EMATrader(state, new_traderData)
+        lin_trend_trader = LinearTrendTrader(state, new_traderData)
 
-        for product, od in state.order_depths.items():
-            position = state.position.get(product, 0)
-            pos_limit = POSITION_LIMITS.get(product, 20)
-            mid = _compute_mid(od)
+        # STEP 3: get orders
+        result.update(ema_trader.get_orders())
+        result.update(lin_trend_trader.get_orders())
 
-            # ── Fair value ──────────────────────────────────────────────────
-            if product == "ASH_COATED_OSMIUM":
-                fair_value = ASH_FAIR_VALUE
-            else:
-                hist = saved["price_history"].get(product, [])
-                if mid is not None:
-                    hist.append(mid)
-                    hist = hist[-IPR_WINDOW:]
-                saved["price_history"][product] = hist
-                fair_value = sum(hist) / len(hist) if hist else mid
+        # STEP 4: Update TraderData
+        # save timestamp
+        ema_trader.update_traderData()
+        lin_trend_trader.update_traderData()
 
-            if fair_value is None:
-                result[product] = []
-                continue
-
-            fair_int = int(round(fair_value))
-            orders: List[Order] = []
-
-            # Remaining position headroom (updated as we size orders below)
-            buy_cap = pos_limit - position   # how many units we can still buy
-            sell_cap = pos_limit + position  # how many units we can still sell
-
-            # ── Market-take: buy cheap, sell dear ───────────────────────────
-            # Buy bot sell orders priced strictly below our fair value
-            for ask in sorted(od.sell_orders):
-                if ask >= fair_int or buy_cap <= 0:
-                    break
-                qty = min(-od.sell_orders[ask], buy_cap)
-                orders.append(Order(product, ask, qty))
-                buy_cap -= qty
-                position += qty
-
-            # Sell bot buy orders priced strictly above our fair value
-            for bid in sorted(od.buy_orders, reverse=True):
-                if bid <= fair_int or sell_cap <= 0:
-                    break
-                qty = min(od.buy_orders[bid], sell_cap)
-                orders.append(Order(product, bid, -qty))
-                sell_cap -= qty
-                position -= qty
-
-            # ── Market-make: post inside the bot spread ─────────────────────
-            if buy_cap > 0:
-                orders.append(Order(product, fair_int - 1, min(buy_cap, MM_SIZE)))
-            if sell_cap > 0:
-                orders.append(Order(product, fair_int + 1, -min(sell_cap, MM_SIZE)))
-
-            result[product] = orders
-
-        return result, 0, jsonpickle.encode(saved)
+        new_traderData.update(ema_trader.new_traderData)
+        new_traderData.update(lin_trend_trader.new_traderData)
 
 
-def _compute_mid(od: OrderDepth):
-    """Best-bid/ask midpoint; falls back to whichever side is available."""
-    if od.buy_orders and od.sell_orders:
-        return (max(od.buy_orders) + min(od.sell_orders)) / 2
-    if od.buy_orders:
-        return float(max(od.buy_orders))
-    if od.sell_orders:
-        return float(min(od.sell_orders))
-    return None
+        # STEP 5:ENCODE TraderData
+        traderData = jsonpickle.encode(new_traderData)
+        conversions = 0
+        return result, conversions, traderData
+
+
