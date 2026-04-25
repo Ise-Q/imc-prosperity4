@@ -6,9 +6,10 @@ import statistics
 import math
 
 
-# ASH: EMA(alpha = 0.05) fair value + take/clear/make | IPR: buy-and-hold
+# mm hydrogel, mm velvetfruit extract. Trade mispriced options using upper and lower bounds
 
-PRODUCTS = ["INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM"]
+PRODUCTS = ["HYDROGEL_PACK", "VELVETFRUIT_EXTRACT"]
+OPTION_CHAIN = []
 POS_LIMITS = {
     'ASH_COATED_OSMIUM': 80,
     "INTARIAN_PEPPER_ROOT": 80
@@ -17,7 +18,7 @@ PARAMS = {
     "ASH_COATED_OSMIUM": {
       "ema_alpha": 0.05,
       "static_fv" : 10_000,
-      "fv_method_weights" : [0.5, 0.5], # [static, ema]
+      "fv_method_weights" : [1, 0], # [static, ema]
       "take_margin": 1,
       "clear_margin": 6, "make_margin": 4
     },
@@ -264,62 +265,6 @@ class MeanReversionTrader(ProductTrader):
             self.sell(ask_price, self.max_allowed_sell_volume)
         if bid_price is not None and self.max_allowed_buy_volume > 0:
             self.buy(bid_price, self.max_allowed_buy_volume)
-
-
-        return {self.name : self.orders}
-
-
-
-class LinearTrendTrader(ProductTrader):
-    def __init__(self, state, new_traderData):
-        super().__init__("INTARIAN_PEPPER_ROOT", state, new_traderData)
-        self.alpha = PARAMS[self.name]["intercept"]
-        self.beta = PARAMS[self.name]["slope"]
-        self.fair_value = self.compute_fair_value()
-
-    def compute_fair_value(self):
-        """
-        fair value is a linear relationship with respect global time index
-        fair = alpha + beta * g_time_index
-        where
-            g_time_index = day_offset * 1e6 + timestamp
-
-        we reverse engineer day_offset at first iteration and save it in traderData
-        """
-        day_offset = self.last_traderData[self.name].get("day_offset", None)
-        if (day_offset is None):
-            # if day offset is not included in trader data, we reverse engineer by using mid price
-            day_offset = round((self.compute_mid_price() - self.alpha) / (self.beta * 1_000_000))
-
-            g_time_index = day_offset * 1_000_000 + self.timestamp
-            fair = self.alpha + self.beta * g_time_index
-
-            # update trader data
-            self.new_traderData[self.name]["day_offset"] = day_offset
-
-        else:
-            # if day offset is in traderData, use it to compute fair
-            # first check if we should use a new day_offset
-            if self.timestamp < self.last_traderData[self.name]["last_timestamp"]:
-                day_offset += 1 # increment day_offset by 1
-
-
-            g_time_index = day_offset * 1_000_000 + self.timestamp
-            fair = self.alpha + self.beta * g_time_index
-            # update day offset
-            self.new_traderData[self.name]["day_offset"] = day_offset
-        return round(fair)
-
-
-    def get_orders(self):
-        """
-        buy-hold
-        """
-
-        # buy at aggressive prices
-        if self.quoted_sell_orders:
-            agg_sp = list(self.quoted_sell_orders.keys())[-1] # highest offer
-            self.buy(agg_sp, self.position_limit)
 
 
         return {self.name : self.orders}
