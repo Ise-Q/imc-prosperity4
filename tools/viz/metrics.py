@@ -1,16 +1,36 @@
 """Per-product market metrics derived from the activities dataframe.
 
 Formulas for position, edge stats, and missed-opp analysis mirror
-`round1/notebooks/analyze_results.ipynb`. VWAP and wall-mid are new.
+`round1/notebooks/analyze_results.ipynb`. Microprice and wall-mid are new.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
+from tools.viz.black_scholes import (
+    BlackScholes,
+    DEFAULT_IV,
+    IV_EMA_ALPHA,
+    TICKS_PER_DAY,
+    TRADING_DAYS_PER_YEAR,
+    TTE_DAYS_AT_ROUND_START,
+    UNDERLYING,
+    VOUCHER_STRIKE,
+)
+
 POSITION_LIMITS: dict[str, int] = {
+    # Round 1 / 2
     "ASH_COATED_OSMIUM": 80,
     "INTARIAN_PEPPER_ROOT": 80,
+    # Round 3 — d1
+    "HYDROGEL_PACK": 200,
+    "VELVETFRUIT_EXTRACT": 200,
+    # Round 3 — options (VEV_* calls on VELVETFRUIT_EXTRACT)
+    "VEV_4000": 300, "VEV_4500": 300, "VEV_5000": 300,
+    "VEV_5100": 300, "VEV_5200": 300, "VEV_5300": 300,
+    "VEV_5400": 300, "VEV_5500": 300, "VEV_6000": 300,
+    "VEV_6500": 300,
 }
 DEFAULT_POSITION_LIMIT = 80
 
@@ -24,7 +44,7 @@ def position_limit(product: str) -> int:
 def enrich_activities(activities: pd.DataFrame) -> pd.DataFrame:
     """Return activities with derived per-row metrics attached.
 
-    Adds: `best_bid`, `best_ask`, `mid`, `spread`, `ob_vwap`, `wall_mid`,
+    Adds: `best_bid`, `best_ask`, `mid`, `spread`, `microprice`, `wall_mid`,
     `ob_empty`.
 
     Conventions (see memory `project_ob_empty_definition.md`):
@@ -48,8 +68,8 @@ def enrich_activities(activities: pd.DataFrame) -> pd.DataFrame:
     df["spread"] = best_ask - best_bid
     df["ob_empty"] = best_bid.isna() & best_ask.isna()
 
-    df["ob_vwap"] = _compute_ob_vwap(df)
     df["wall_mid"] = _compute_wall_mid(df)
+    df["microprice"] = _compute_microprice(df)
 
     if "profit_and_loss" in df.columns:
         # The Rust backtester emits PnL using mid_price=0.0 on fully-empty-OB
@@ -73,25 +93,19 @@ def _best_prices(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return best_bid, best_ask
 
 
-def empty_ob_timestamps(activities_for_product: pd.DataFrame) -> np.ndarray:
-    """Return sorted `global_ts` values where the orderbook is fully empty."""
-    if activities_for_product.empty or "ob_empty" not in activities_for_product.columns:
-        return np.array([], dtype=int)
-    mask = activities_for_product["ob_empty"].fillna(False).astype(bool)
-    return np.sort(activities_for_product.loc[mask, "global_ts"].to_numpy())
-
-
-def _compute_ob_vwap(df: pd.DataFrame) -> pd.Series:
-    num = pd.Series(0.0, index=df.index)
-    den = pd.Series(0.0, index=df.index)
-    for i in LEVELS:
-        bp = df[f"bid_price_{i}"].fillna(0)
-        bv = df[f"bid_volume_{i}"].fillna(0)
-        ap = df[f"ask_price_{i}"].fillna(0)
-        av = df[f"ask_volume_{i}"].fillna(0)
-        num = num + bp * bv + ap * av
-        den = den + bv + av
-    return num.where(den > 0) / den.where(den > 0)
+def _compute_microprice(df: pd.DataFrame) -> pd.Series:
+    """L1 inside microprice = (best_bid * ask_vol_1 + best_ask * bid_vol_1) /
+    (bid_vol_1 + ask_vol_1). Uses `best_bid`/`best_ask` (L1→L3 fallback) for
+    consistency with `mid`/`spread`; volumes from L1 only.
+    """
+    bb = df["best_bid"]
+    ba = df["best_ask"]
+    bv = df["bid_volume_1"]
+    av = df["ask_volume_1"]
+    num = bb * av + ba * bv
+    den = bv + av
+    out = num.where(den > 0) / den.where(den > 0)
+    return out.where(bb.notna() & ba.notna())
 
 
 def _compute_wall_mid(df: pd.DataFrame) -> pd.Series:
@@ -189,3 +203,77 @@ def missed_opps(
     df["missed_buy"] = (df["position"] >= limit) & (df["ask_price_1"] < fair_value)
     df["missed_sell"] = (df["position"] <= -limit) & (df["bid_price_1"] > fair_value)
     return df
+
+
+def attach_bs_fair_value(
+    activities_by_product: dict[str, pd.DataFrame],
+    days: list[int],
+) -> dict[str, pd.DataFrame]:
+    """For each VEV_* call voucher in `activities_by_product`, attach a
+    `bs_fair_value` column computed from BlackScholes.call_price using:
+
+    - S = VELVETFRUIT_EXTRACT mid aligned by `global_ts`,
+    - K = strike from VOUCHER_STRIKE,
+    - T = TTE in years (TTE_DAYS_AT_ROUND_START - day_offset - ts/TICKS_PER_DAY,
+      then / TRADING_DAYS_PER_YEAR; clamped to 1e-6),
+    - sigma = live IV (bisection on option mid) → EMA → DEFAULT_IV fallback,
+      mirroring `OptionTrader` in `round3/strats/trader2.py`.
+
+    Mutates and returns the same dict (with replaced frames where applicable).
+    Products without a strike mapping or without a usable underlying mid are
+    left untouched.
+    """
+    underlying_acts = activities_by_product.get(UNDERLYING)
+    if underlying_acts is None or underlying_acts.empty:
+        return activities_by_product
+
+    s_lookup = (
+        underlying_acts[["global_ts", "mid"]]
+        .dropna(subset=["mid"])
+        .drop_duplicates("global_ts", keep="last")
+        .set_index("global_ts")["mid"]
+    )
+    if s_lookup.empty:
+        return activities_by_product
+
+    day_zero = min(days) if days else 0
+
+    for product, acts in list(activities_by_product.items()):
+        K = VOUCHER_STRIKE.get(product)
+        if K is None or acts.empty:
+            continue
+
+        df = acts.copy()
+        S_series = df["global_ts"].map(s_lookup).to_numpy(dtype=float)
+        day_offset = (df["day"].astype(int) - int(day_zero)).clip(lower=0).to_numpy()
+        ts = df["timestamp"].astype(int).to_numpy()
+
+        tte_days = TTE_DAYS_AT_ROUND_START - day_offset - ts / TICKS_PER_DAY
+        tte_days = np.clip(tte_days, 1e-6, None)
+        T_arr = tte_days / TRADING_DAYS_PER_YEAR
+        C_arr = df["mid"].to_numpy(dtype=float)
+
+        n = len(df)
+        fair = np.full(n, np.nan)
+        ema = None
+        # Time order — within a single product, (day, timestamp) defines time.
+        order = np.lexsort((ts, df["day"].to_numpy()))
+
+        for i in order:
+            S = S_series[i]
+            T = T_arr[i]
+            C = C_arr[i]
+            if not (np.isfinite(S) and np.isfinite(T)) or S <= 0 or T <= 0:
+                continue
+            live = None
+            if np.isfinite(C):
+                live = BlackScholes.implied_vol(float(C), float(S), float(K), float(T))
+            if live is not None:
+                ema = live if ema is None else IV_EMA_ALPHA * live + (1 - IV_EMA_ALPHA) * ema
+            iv_used = live if live is not None else (ema if ema is not None else DEFAULT_IV)
+            fair[i] = BlackScholes.call_price(float(S), float(K), float(T), float(iv_used))
+
+        df["bs_fair_value"] = fair
+        activities_by_product[product] = df
+
+    return activities_by_product

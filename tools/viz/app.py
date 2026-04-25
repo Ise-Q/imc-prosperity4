@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 
 from tools.viz.metrics import (
     align_position_to_activities,
-    empty_ob_timestamps,
+    attach_bs_fair_value,
     enrich_activities,
     position_limit,
     position_timeline,
@@ -28,10 +28,10 @@ DEPTH_STYLES = {
 }
 
 MID_COLOR = "#111111"
-OB_VWAP_COLOR = "#1f77b4"
 WALL_MID_COLOR = "#ff7f0e"
+MICROPRICE_COLOR = "#17becf"   # teal
+BS_FAIR_COLOR = "#d62728"      # red
 SPREAD_COLOR = "#1f77b4"
-EMPTY_OB_COLOR = "rgba(150,150,150,0.35)"
 
 OWN_BUY_COLOR = "#0b7a0b"
 OWN_SELL_COLOR = "#b00020"
@@ -65,6 +65,10 @@ def precompute(log: LoadedLog) -> Precomputed:
         trades_by_product[product] = t
         position_by_product[product] = align_position_to_activities(p, t)
         position_timeline_by_product[product] = position_timeline(t)
+
+    # Attach Black-Scholes fair-value series for VEV_* call vouchers (no-op
+    # when the underlying VELVETFRUIT_EXTRACT isn't present in the log).
+    attach_bs_fair_value(activities_by_product, log.days)
 
     return Precomputed(
         activities_by_product=activities_by_product,
@@ -128,9 +132,9 @@ def build_app(log: LoadedLog) -> Dash:
                             id="overlay-toggles",
                             options=[
                                 {"label": " mid", "value": "mid"},
-                                {"label": " ob_vwap", "value": "ob_vwap"},
                                 {"label": " wall_mid", "value": "wall_mid"},
-                                {"label": " empty_ob", "value": "empty_ob"},
+                                {"label": " microprice", "value": "microprice"},
+                                {"label": " bs_fair", "value": "bs_fair_value"},
                             ],
                             value=["mid"],
                             inline=True,
@@ -349,8 +353,6 @@ def build_figure(
         subplot_titles=subplot_titles,
     )
 
-    render_empty_ob = "empty_ob" in overlays
-
     for idx, product in enumerate(products):
         price_row = rows_per_product * idx + 1
         spread_row = price_row + 1
@@ -385,11 +387,6 @@ def build_figure(
         _add_position_panel(fig, pos_tl_f, price_row=pos_row, product=product)
         _add_pnl_panel(fig, acts_f, pnl_row)
 
-        if render_empty_ob:
-            _add_empty_ob_markers(
-                fig, acts_f, first_row=price_row, rows=rows_per_product,
-            )
-
         fig.update_yaxes(title_text="price", row=price_row, col=1)
         fig.update_yaxes(title_text="spread", row=spread_row, col=1)
         fig.update_yaxes(title_text="position", row=pos_row, col=1)
@@ -422,19 +419,17 @@ def _add_depth_lines(fig: go.Figure, acts: pd.DataFrame, row: int, levels: set[i
         alpha = style["alpha"]
         width = style["width"]
         bid_price = acts[f"bid_price_{level}"]
-        bid_vol = acts[f"bid_volume_{level}"]
         ask_price = acts[f"ask_price_{level}"]
-        ask_vol = acts[f"ask_volume_{level}"]
 
         _add_depth_side(
-            fig, x, bid_price, bid_vol, row,
-            name=f"bid L{level}", level=level, side="bid",
+            fig, x, bid_price, row,
+            name=f"bid L{level}",
             color=f"rgba({BID_COLOR},{alpha})", width=width,
             legendgroup=f"bid_L{level}",
         )
         _add_depth_side(
-            fig, x, ask_price, ask_vol, row,
-            name=f"ask L{level}", level=level, side="ask",
+            fig, x, ask_price, row,
+            name=f"ask L{level}",
             color=f"rgba({ASK_COLOR},{alpha})", width=width,
             legendgroup=f"ask_L{level}",
         )
@@ -444,12 +439,9 @@ def _add_depth_side(
     fig: go.Figure,
     x: pd.Series,
     price: pd.Series,
-    qty: pd.Series,
     row: int,
     *,
     name: str,
-    level: int,
-    side: str,
     color: str,
     width: float,
     legendgroup: str,
@@ -466,34 +458,6 @@ def _add_depth_side(
         ),
         row=row, col=1,
     )
-
-    hover_y = price.ffill().bfill()
-    if hover_y.isna().all():
-        return
-
-    customdata = _price_qty_customdata(price, qty)
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=hover_y,
-            name=name,
-            mode="markers",
-            marker=dict(size=1, opacity=0, color=color),
-            customdata=customdata,
-            legendgroup=legendgroup,
-            showlegend=False,
-            hovertemplate=(
-                f"L{level} {side} px: %{{customdata[0]}} / qty: %{{customdata[1]}}"
-                "<extra></extra>"
-            ),
-        ),
-        row=row, col=1,
-    )
-
-
-def _price_qty_customdata(price: pd.Series, qty: pd.Series) -> np.ndarray:
-    px_str = np.where(price.isna(), "N/A", price.map(lambda v: f"{v:.1f}" if pd.notna(v) else "N/A"))
-    qty_str = np.where(qty.isna(), "N/A", qty.map(lambda v: f"{int(v)}" if pd.notna(v) else "N/A"))
-    return np.column_stack([px_str, qty_str])
 
 
 def _add_spread(fig: go.Figure, acts: pd.DataFrame, row: int) -> None:
@@ -515,27 +479,6 @@ def _add_spread(fig: go.Figure, acts: pd.DataFrame, row: int) -> None:
     fig.add_hline(y=0, line=dict(color="#999", width=0.6, dash="dot"), row=row, col=1)
 
 
-def _add_empty_ob_markers(
-    fig: go.Figure, acts: pd.DataFrame, first_row: int, rows: int,
-) -> None:
-    """Draw grey dotted vertical markers at ticks where the orderbook is
-    fully empty on both sides. Scoped to the subplot rows of a single
-    product so markers don't bleed across products in stacked mode.
-    """
-    if acts.empty:
-        return
-    ts_arr = empty_ob_timestamps(acts)
-    if ts_arr.size == 0:
-        return
-    for ts in ts_arr:
-        for offset in range(rows):
-            fig.add_vline(
-                x=int(ts),
-                line=dict(color=EMPTY_OB_COLOR, width=0.6, dash="dot"),
-                row=first_row + offset, col=1,
-            )
-
-
 def _add_overlays(fig: go.Figure, acts: pd.DataFrame, row: int, overlays: set[str]) -> None:
     if acts.empty:
         return
@@ -543,8 +486,9 @@ def _add_overlays(fig: go.Figure, acts: pd.DataFrame, row: int, overlays: set[st
     x = acts["global_ts"]
     specs = [
         ("mid", acts["mid"], MID_COLOR, "solid", 1.6),
-        ("ob_vwap", acts.get("ob_vwap"), OB_VWAP_COLOR, "solid", 1.2),
         ("wall_mid", acts.get("wall_mid"), WALL_MID_COLOR, "dash", 1.2),
+        ("microprice", acts.get("microprice"), MICROPRICE_COLOR, "solid", 1.2),
+        ("bs_fair_value", acts.get("bs_fair_value"), BS_FAIR_COLOR, "dot", 1.4),
     ]
 
     for name, y, color, dash, width in specs:
@@ -781,7 +725,7 @@ def _price_y_range(
                 col = f"{side}_price_{level}"
                 if col in acts_f.columns:
                     pieces.append(acts_f[col])
-        for name in ("mid", "ob_vwap", "wall_mid"):
+        for name in ("mid", "wall_mid", "microprice", "bs_fair_value"):
             if name in overlays and name in acts_f.columns:
                 pieces.append(acts_f[name])
     if not trades_f.empty and "price" in trades_f.columns:
