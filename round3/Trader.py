@@ -149,16 +149,19 @@ class HydrogelTrader(ProductTrader):
     """
     Take/Clear/Make around static fair value 9991.
 
-    Improvement over v2: MAKE orders are position-aware.
-    When position is significantly one-sided, we suppress the MAKE order
-    in the direction that would worsen inventory.  This prevents runaway
-    accumulation on trending days (which caused -516 in log 386056).
+    Three-layer inventory control (fixes HYDROGEL long accumulation in log 402017):
+      TAKE_LONG_GATE = 10 — stop TAKE-buying when already long ≥ 10.
+        Root cause: on down-trending days (10011→9960), TAKE orders fire whenever
+        ask < 9989 (= fair-2), driving position from -50 to +50 in 2k ticks.
+        Gate stops accumulation before we become significantly long.
+      MAKE_GATE = 25 — suppress passive MAKE bid when pos ≥ 25.
+        Secondary protection against MAKE fills beyond the TAKE gate.
 
-    Rule: only post MAKE bid when pos < +make_gate (default +25),
-          only post MAKE ask when pos > -make_gate (default -25).
+    Asymmetric gates: SELL side is NOT gated (selling when overbought is correct).
     """
 
-    MAKE_GATE = 25  # suppress MAKE when abs(pos) > this threshold
+    TAKE_LONG_GATE = 10  # stop TAKE-buying when pos reaches this
+    MAKE_GATE      = 25  # suppress MAKE bid/ask when |pos| exceeds this
 
     def __init__(self, name, state, last_traderData, new_traderData):
         super().__init__(name, state, last_traderData, new_traderData)
@@ -185,14 +188,17 @@ class HydrogelTrader(ProductTrader):
     def get_orders(self):
         fv = self.fair_value
 
-        # TAKE: hit overpriced bids, lift underpriced asks
+        # TAKE: hit overpriced bids (no long-side gate — selling overbought is correct)
         for bp, bv in self.quoted_buy_orders.items():
             if bp < fv + self.take_margin:
                 break
             self.sell(bp, bv)
 
+        # TAKE: lift cheap asks — STOP when already long ≥ TAKE_LONG_GATE
         for sp, sv in self.quoted_sell_orders.items():
             if sp > fv - self.take_margin:
+                break
+            if self.expected_position >= self.TAKE_LONG_GATE:
                 break
             self.buy(sp, sv)
 
