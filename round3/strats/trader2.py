@@ -31,7 +31,7 @@ PARAMS = {
     "HYDROGEL_PACK": {
         "ema_alpha": 0.05,
         "static_fv": 9990,
-        "fv_method_weights": [1.0, 0.0],   # [static, ema]
+        "fv_method_weights": [0.5, 0.5],   # [static, ema]
         "take_margin": 2,
         "clear_margin": 6,
         "make_margin": 4,
@@ -40,7 +40,7 @@ PARAMS = {
     "VELVETFRUIT_EXTRACT": {
         "ema_alpha": 0.05,
         "static_fv": 5250,
-        "fv_method_weights": [0.0, 1.0],   # [static, ema]
+        "fv_method_weights": [0, 1],   # [static, ema]
         "take_margin": 1,
         "clear_margin": 3,
         "make_margin": 2,
@@ -211,7 +211,7 @@ class MeanReversionTrader(ProductTrader):
 # OptionArbitrageTrader — lifts asks < max(S-K,0), hits bids > S
 # =============================================================================
 
-class OptionArbitrageTrader(ProductTrader):
+class OptionTrader(ProductTrader):
     """
     European-call no-arb bounds with r=0, q=0:
         max(S - K, 0)  <=  C  <=  S
@@ -263,11 +263,12 @@ class Trader:
         underlying_mid = vee_trader.compute_mid_price()
 
         for v in TRADED_VOUCHERS:
-            traders.append(OptionArbitrageTrader(v, state, new_traderData, underlying_mid))
+            traders.append(OptionTrader(v, state, new_traderData, underlying_mid))
 
         for t in traders:
-            result.update(t.get_orders())
-            t.update_traderData()
+            if t.name == "HYDROGEL_PACK":
+                result.update(t.get_orders())
+                t.update_traderData()
 
         return result, 0, jsonpickle.encode(new_traderData)
 
