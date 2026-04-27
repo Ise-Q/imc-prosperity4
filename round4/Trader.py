@@ -4,43 +4,48 @@ import jsonpickle
 import math
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROUND 4 — single-file Trader
+#  ROUND 4 — rebuilt after log 509764 forensic analysis
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  Products:
-#    VELVETFRUIT_EXTRACT  — underlying, mean ~5248, spread ~5
-#    VEV_XXXX             — call options (strikes 4000–6500)
-#    HYDROGEL_PACK        — OU mean-reversion, mu~9995, spread=16, HL=350 ticks
+#  Root causes fixed vs 509764:
+#    BUG 1 — ProductTrader cross-update: buy() was adding to max_allowed_sell_volume
+#             and sell() was adding to max_allowed_buy_volume. This caused total orders
+#             to exceed position limits every tick. Platform rejected ALL HYDROGEL orders.
+#             Fix: each side's allowance only decreases, never cross-increments.
 #
-#  Round 4 calibration (from EDA on rounds_4_day_1/2/3):
-#    sigma           = 0.02168   (up from 0.02155 in R3)
-#    HYDROGEL mu     = 9995      (up from 9991 in R3)
-#    T_remaining     = 3.0 − (day_offset + timestamp / 1_000_000)
-#    Options expiry  = T=0 at end of day 3 (3-day round; days labeled 1/2/3)
+#    BUG 2 — Delta hedge destruction: buying 181 VEV at 5299 with wrong T=3.0 deltas
+#             into a -42 tick fall. Cost -8405. Options only +5664. Net -2741.
+#             Fix: DISABLE delta hedge entirely. Options profit from theta, not delta.
+#             On day 3 (T→0), OTM delta < 0.1 → hedge spread cost > hedge benefit.
 #
-#  Round 4 options mispricing pattern (DIFFERS from R3):
-#    Day 1 (T: 3→2): market is BELOW BS by 3–5 ticks → DO NOT SELL (threshold=10 protects)
-#    Day 2 (T: 2→1): market is ABOVE BS by +6–8 ticks → sell when bid > BS+5
-#    Day 3 (T: 1→0): market is ABOVE BS by +20–22 ticks → sell very aggressively
+#    BUG 3 — HYDROGEL FV wrong: static 9995 vs actual day-3 mean 10033.5.
+#             Fix: dynamic FV from EMA of order book mid. Always stays near market.
 #
-#  Round 4 position limits (doubled/quadrupled vs R3):
-#    VELVETFRUIT_EXTRACT : 200   (was 600 — tighter)
-#    HYDROGEL_PACK       : 200   (was 50  — 4× increase)
-#    VEV_*               : 300   (was 200 — 50% increase)
+#    BUG 4 — Wrong T_remaining: fresh start on day 3 gave T=3.0 instead of 1.0.
+#             Fix: detect day from option market prices as sanity check.
 #
-#  Round 4 new feature: counterparty IDs on market trades.
-#  Counterparty profiles (from EDA on 4,281 trades):
-#    Mark 01  — informed buyer VEV, 83% win rate, systematic call buyer → FOLLOW
-#    Mark 14  — profitable MM hydrogel (buys FV-8, sells FV+8, 90% win) → FOLLOW
-#    Mark 22  — systematic option seller (competitor) → IGNORE
-#    Mark 38  — systematic loser hydrogel (buys FV+8, sells FV-8, 9% win) → FADE
-#    Mark 49  — noise buyer VEV, 33% win rate → FADE
-#    Mark 55  — liquidity/noise VEV → IGNORE
-#    Mark 67  — directional buyer VEV (never sells) → mild FOLLOW
+#  Products (Round 4):
+#    VELVETFRUIT_EXTRACT  — underlying, spread ~5 ticks
+#    VEV_XXXX             — call options (strikes 4000–6500), expire T=0
+#    HYDROGEL_PACK        — OU mean-reversion, but FV drifts between days
+#
+#  Position limits (Round 4):
+#    VELVETFRUIT_EXTRACT : 200
+#    HYDROGEL_PACK       : 200
+#    VEV_*               : 300
+#
+#  Counterparty profiles (from EDA + log analysis):
+#    Mark 01  — systematic call buyer (funds our option premium), VEV informed seller
+#    Mark 14  — HYDROGEL profitable MM (buys FV-8, sells FV+8), VEV informed seller
+#    Mark 22  — competing option seller
+#    Mark 38  — HYDROGEL systematic loser (buys FV+8, sells FV-8, 9% win)
+#    Mark 49  — VEV noise (33% win, fade)
+#    Mark 55  — VEV liquidity/noise
+#    Mark 67  — VEV directional buyer (never sells)
 
-STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+STRIKES      = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 VEV_PRODUCTS = [f"VEV_{k}" for k in STRIKES]
-PRODUCTS    = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_PRODUCTS
+PRODUCTS     = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_PRODUCTS
 
 POS_LIMITS: Dict[str, int] = {
     "VELVETFRUIT_EXTRACT": 200,
@@ -48,33 +53,25 @@ POS_LIMITS: Dict[str, int] = {
     **{f"VEV_{k}": 300 for k in STRIKES},
 }
 
-# ── Options parameters ────────────────────────────────────────────────────────
+# ── Options ───────────────────────────────────────────────────────────────────
 
-SIGMA        = 0.02168   # recalibrated from Round 4 realized vol
-EXPIRY_DAYS  = 3.0       # T_remaining = 3.0 - (day_offset + ts/1e6)
+SIGMA        = 0.02168
+EXPIRY_DAYS  = 3.0
 
 SELL_STRIKES = [5200, 5300, 5400, 5500]
 
-# Conservative per-strike short caps (increased vs R3, delta hedge now active)
+# Per-strike short caps. Conservative — options are the clean profit source.
 OPTION_MAX_SHORT: Dict[int, int] = {
-    5200: 75,    # ITM, delta~0.8 — keep tight
-    5300: 100,   # near-ATM, delta~0.5
-    5400: 150,   # OTM, delta~0.3
-    5500: 200,   # deep OTM, delta~0.15
+    5200: 75,
+    5300: 100,
+    5400: 150,
+    5500: 200,
 }
 
-# ── Counterparty signal config ────────────────────────────────────────────────
+# ── Counterparty IDs ──────────────────────────────────────────────────────────
 
-# VEV underlying: follow informed buyers, fade noise
-FOLLOW_VEV = frozenset({"Mark 01", "Mark 14", "Mark 67"})
-FADE_VEV   = frozenset({"Mark 49"})
-
-# HYDROGEL: Mark 14 = informed MM (follow), Mark 38 = systematic loser (fade)
-FOLLOW_HYD = frozenset({"Mark 14"})
-FADE_HYD   = frozenset({"Mark 38"})
-
-# Max directional units to add from counterparty signal on VEV underlying
-CP_VEV_LIMIT = 40   # conservative: only 40/200 of position limit is signal-driven
+# HYDROGEL: Mark 38 is the systematic loser (buys FV+8, sells FV-8) — fade their flow.
+FADE_HYD = frozenset({"Mark 38"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,31 +90,34 @@ def _bs_call(S: float, K: float, T: float, sigma: float) -> float:
     return S * _norm_cdf(d1) - K * _norm_cdf(d2)
 
 
-def _bs_delta(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 0:
-        return 1.0 if S > K else 0.0
-    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-    return _norm_cdf(d1)
-
-
-def _counterparty_signal(market_trades: dict, symbol: str,
-                          follow: frozenset, fade: frozenset) -> int:
+def _detect_day_from_options(state: TradingState, underlying_mid: float) -> Optional[int]:
     """
-    Net signed volume from predictive counterparties in the last tick.
-    +N = informed net buy pressure of N units (bullish signal).
-    -N = informed net sell pressure (bearish signal).
+    Estimate day_offset from option market prices when traderData is unavailable.
+    At T=3.0: BS gives high values. At T=1.0: much lower.
+    Compare market price of VEV_5300 to BS at T=3,2,1 → pick closest.
+    Returns estimated day_offset (0, 1, or 2) or None if unable.
     """
-    trades = market_trades.get(symbol, [])
-    signal = 0
-    for t in trades:
-        qty    = getattr(t, 'quantity', 0)
-        buyer  = getattr(t, 'buyer',   '')
-        seller = getattr(t, 'seller',  '')
-        if buyer in follow or seller in fade:
-            signal += qty
-        if seller in follow or buyer in fade:
-            signal -= qty
-    return signal
+    if underlying_mid is None:
+        return None
+    od = state.order_depths.get("VEV_5300")
+    if od is None:
+        return None
+    if not od.buy_orders or not od.sell_orders:
+        return None
+    mkt_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
+    if mkt_mid <= 0:
+        return None
+
+    best_offset = 0
+    best_err = float("inf")
+    for offset in [0, 1, 2]:
+        T_guess = max(EXPIRY_DAYS - offset, 0.01)
+        bs_guess = _bs_call(underlying_mid, 5300, T_guess, SIGMA)
+        err = abs(bs_guess - mkt_mid)
+        if err < best_err:
+            best_err = err
+            best_offset = offset
+    return best_offset
 
 
 def default_traderData() -> dict:
@@ -125,24 +125,33 @@ def default_traderData() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BASE CLASS
+#  BASE CLASS — BUG FIX: no cross-update between buy/sell allowances
 # ─────────────────────────────────────────────────────────────────────────────
+#
+#  Previous code in buy():  self.max_allowed_sell_volume += vol  (WRONG)
+#  Previous code in sell(): self.max_allowed_buy_volume  += vol  (WRONG)
+#
+#  Why it was wrong: each side's allowance is independently bounded by the
+#  position limit. After submitting sell orders, remaining sell capacity should
+#  ONLY decrease. Cross-incrementing the buy side is meaningless to the platform.
+#  The platform checks: sum(sell_orders) ≤ limit + current_pos per side.
+#  Cross-incrementing caused sum(sell_orders) > limit, rejected every tick.
 
 PARAMS = {
     "HYDROGEL_PACK": {
-        "static_fv"   : 9995,   # Round 4 OU mu (recalibrated)
         "take_margin" : 2,
         "clear_margin": 4,
         "make_margin" : 3,
+        "ema_alpha"   : 0.05,   # slow EMA for adaptive FV
     },
 }
 
 
 class ProductTrader:
     def __init__(self, name: str, state: TradingState, last_td: dict, new_td: dict):
-        self.orders   = []
-        self.name     = name
-        self.state    = state
+        self.orders    = []
+        self.name      = name
+        self.state     = state
         self.timestamp = state.timestamp
         self.new_traderData  = new_td.setdefault(name, {})
         self.params          = PARAMS.get(name, {})
@@ -153,6 +162,7 @@ class ProductTrader:
         self.expected_position = self.starting_position
 
         self.quoted_buy_orders, self.quoted_sell_orders = self._get_order_depth()
+        # Each side is bounded independently by position limit.
         self.max_allowed_buy_volume  = self.position_limit - self.starting_position
         self.max_allowed_sell_volume = self.position_limit + self.starting_position
 
@@ -174,8 +184,8 @@ class ProductTrader:
         vol = min(round(abs(volume)), self.max_allowed_buy_volume)
         if vol <= 0:
             return
-        self.max_allowed_buy_volume  -= vol
-        self.max_allowed_sell_volume += vol
+        self.max_allowed_buy_volume -= vol
+        # FIX: do NOT touch max_allowed_sell_volume here.
         self.orders.append(Order(self.name, round(price), vol))
         self.expected_position += vol
 
@@ -184,7 +194,7 @@ class ProductTrader:
         if vol <= 0:
             return
         self.max_allowed_sell_volume -= vol
-        self.max_allowed_buy_volume  += vol
+        # FIX: do NOT touch max_allowed_buy_volume here.
         self.orders.append(Order(self.name, round(price), -vol))
         self.expected_position -= vol
 
@@ -193,72 +203,91 @@ class ProductTrader:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HYDROGEL_PACK — position-aware mean-reversion + counterparty bias
+#  HYDROGEL_PACK — adaptive FV + counterparty bias
 # ─────────────────────────────────────────────────────────────────────────────
+#
+#  FIX: FV is now an EMA of market mid, not static 9995.
+#  Root cause of failure: day 3 actual mean was 10033.5, our FV was 9995.
+#  All sell orders at 9998 never filled; all buy orders far below market.
+#
+#  Counterparty layer:
+#  Mark 38 consistently buys at FV+8 and sells at FV-8 (9% win rate).
+#  When Mark 38 is buying, price is at a local HIGH — suppress our buys.
+#  When Mark 38 is selling, price is at a local LOW — suppress our sells.
 
 class HydrogelTrader(ProductTrader):
-    """
-    Take/Clear/Make around static FV=9995, enhanced with counterparty signal.
-
-    Counterparty layer (Round 4 insight):
-      Mark 38 is systematically wrong (buys FV+8, sells FV-8, 9% win rate).
-      Mark 14 is systematically right (buys FV-8, sells FV+8, 90% win rate).
-
-      cp_signal > 0: informed flow is NET BUYING → price is currently CHEAP
-        → be more aggressive on BUY side (lower TAKE_LONG_GATE threshold)
-      cp_signal < 0: informed flow is NET SELLING → price is currently RICH
-        → be more aggressive on SELL side, suppress buy MAKE orders
-
-    Three-layer inventory control (inherited from R3 fix):
-      TAKE_LONG_GATE = 20  (was 10 — scaled for 200-unit limit)
-      MAKE_GATE      = 80  (was 25 — scaled for 200-unit limit)
-    """
 
     TAKE_LONG_GATE = 20
     MAKE_GATE      = 80
 
     def __init__(self, name: str, state: TradingState, last_td: dict, new_td: dict):
         super().__init__(name, state, last_td, new_td)
-        self.static_fv    = self.params["static_fv"]
-        self.take_margin  = self.params["take_margin"]
-        self.clear_margin = self.params["clear_margin"]
-        self.make_margin  = self.params["make_margin"]
-        self.fair_value   = self.static_fv
+        p = self.params
 
-        # Counterparty signal: >0 = informed net buying (price cheap), <0 = selling (rich)
-        self.cp_signal = _counterparty_signal(
-            state.market_trades, name, FOLLOW_HYD, FADE_HYD
-        )
+        # Adaptive FV: EMA of market mid, initialized from order book on first tick.
+        ob_mid = None
+        bb = self.get_best_bid()
+        ba = self.get_best_ask()
+        if bb is not None and ba is not None:
+            ob_mid = (bb + ba) / 2.0
+
+        prev_fv  = self.last_traderData.get("fv_ema", ob_mid)
+        alpha    = p.get("ema_alpha", 0.05)
+        if prev_fv is None:
+            self.fair_value = ob_mid if ob_mid else 10000.0
+        elif ob_mid is None:
+            self.fair_value = prev_fv
+        else:
+            self.fair_value = (1 - alpha) * prev_fv + alpha * ob_mid
+
+        self.new_traderData["fv_ema"] = self.fair_value
+
+        self.take_margin  = p.get("take_margin",  2)
+        self.clear_margin = p.get("clear_margin", 4)
+        self.make_margin  = p.get("make_margin",  3)
+
+        # Counterparty signal: detect Mark 38 direction to fade them.
+        hyd_trades = state.market_trades.get(name, [])
+        self.cp_signal = 0
+        for t in hyd_trades:
+            qty    = getattr(t, 'quantity', 0)
+            buyer  = getattr(t, 'buyer',   '')
+            seller = getattr(t, 'seller',  '')
+            if buyer in FADE_HYD:
+                # Mark 38 buying = price at local HIGH → fade = we should SELL
+                self.cp_signal -= qty
+            if seller in FADE_HYD:
+                # Mark 38 selling = price at local LOW → fade = we should BUY
+                self.cp_signal += qty
 
     def _make_ask_price(self) -> int:
         fair_ask = self.fair_value + self.make_margin
         ba = self.get_best_ask()
         if ba is None:
-            return fair_ask
-        return ba - 1 if ba > fair_ask else fair_ask
+            return round(fair_ask)
+        return ba - 1 if ba > fair_ask else round(fair_ask)
 
     def _make_bid_price(self) -> int:
         fair_bid = self.fair_value - self.make_margin
         bb = self.get_best_bid()
         if bb is None:
-            return fair_bid
-        return bb + 1 if bb < fair_bid else fair_bid
+            return round(fair_bid)
+        return bb + 1 if bb < fair_bid else round(fair_bid)
 
     def get_orders(self) -> Dict[str, List]:
         fv = self.fair_value
 
-        # Adjust TAKE_LONG_GATE based on counterparty signal:
-        # If informed traders are net buying, we can hold more long inventory
-        gate_adj      = min(20, max(-20, self.cp_signal // 2))
+        # Adjust TAKE_LONG_GATE: if Mark 38 is buying (price HIGH), reduce buy willingness
+        gate_adj      = min(15, max(-15, self.cp_signal // 2))
         effective_gate = self.TAKE_LONG_GATE + gate_adj
 
-        # TAKE: hit overpriced bids (no gate on short side)
+        # TAKE: hit overpriced bids
         for bp, bv in self.quoted_buy_orders.items():
             if bp < fv + self.take_margin:
                 break
             self.sell(bp, bv)
 
-        # TAKE: lift cheap asks — gated by adjusted inventory threshold
+        # TAKE: lift cheap asks — gated
         for sp, sv in self.quoted_sell_orders.items():
             if sp > fv - self.take_margin:
                 break
@@ -275,116 +304,10 @@ class HydrogelTrader(ProductTrader):
 
         # MAKE: passive quotes — suppressed when inventory skewed
         pos = self.expected_position
-        # Suppress make ask when counterparty signal says price is cheap (strong buy signal)
-        suppress_ask = (self.cp_signal > 10 and pos > 0)
-        # Suppress make bid when counterparty signal says price is rich (strong sell signal)
-        suppress_bid = (self.cp_signal < -10 and pos < 0)
-
-        if self.max_allowed_sell_volume > 0 and pos > -self.MAKE_GATE and not suppress_ask:
+        if self.max_allowed_sell_volume > 0 and pos > -self.MAKE_GATE:
             self.sell(self._make_ask_price(), self.max_allowed_sell_volume)
-        if self.max_allowed_buy_volume > 0 and pos < self.MAKE_GATE and not suppress_bid:
+        if self.max_allowed_buy_volume > 0 and pos < self.MAKE_GATE:
             self.buy(self._make_bid_price(), self.max_allowed_buy_volume)
-
-        return {self.name: self.orders}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  VEV UNDERLYING — delta hedge + counterparty signal tilt
-# ─────────────────────────────────────────────────────────────────────────────
-
-class VEVUnderlyingTrader:
-    """
-    Trades VELVETFRUIT_EXTRACT for two purposes:
-      1. Delta hedge the short option book (primary)
-      2. Directional tilt from counterparty signal (secondary, bounded)
-
-    Delta hedge:
-      net_delta = sum(option_pos_i × BS_delta_i)   [neg for short calls]
-      hedge_target = round(-net_delta)              [need long underlying]
-
-    Counterparty signal (Round 4 insight):
-      Mark 01 wins 83% at +1000 ticks — follow their direction
-      Mark 14 wins 77% — follow
-      Mark 49 wins 33% — fade
-      Signal is additive to hedge_target, capped at ±CP_VEV_LIMIT units
-
-    Execution: TAKE-only (aggressive), no passive quoting.
-    Rebalance threshold: 3 units (avoid excessive churn).
-    """
-
-    REBALANCE_THRESHOLD = 3
-
-    def __init__(
-        self,
-        state: TradingState,
-        option_positions: Dict[int, int],
-        option_deltas:    Dict[int, float],
-    ):
-        self.name     = "VELVETFRUIT_EXTRACT"
-        self.lim      = POS_LIMITS["VELVETFRUIT_EXTRACT"]
-        self.orders: List[Order] = []
-
-        self.pos = state.position.get(self.name, 0)
-        self.max_buy  = self.lim - self.pos
-        self.max_sell = self.lim + self.pos
-
-        od = state.order_depths.get(self.name)
-        self.bids: Dict[int, int] = {}
-        self.asks: Dict[int, int] = {}
-        if od:
-            self.bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(),  key=lambda x: -x[0]) if v}
-            self.asks = {p: abs(v) for p, v in sorted(od.sell_orders.items(), key=lambda x:  x[0]) if v}
-
-        # 1. Delta hedge target
-        net_delta = sum(pos * option_deltas.get(k, 0.0) for k, pos in option_positions.items())
-        hedge_target = round(-net_delta)   # negative delta from short calls → need long underlying
-
-        # 2. Counterparty signal tilt
-        cp_signal = _counterparty_signal(state.market_trades, self.name, FOLLOW_VEV, FADE_VEV)
-        # Scale: each unit of signed volume = 0.3 directional units, capped
-        cp_tilt = max(-CP_VEV_LIMIT, min(CP_VEV_LIMIT, round(cp_signal * 0.3)))
-
-        # Total target (capped to position limit)
-        self.target_pos = max(-self.lim, min(self.lim, hedge_target + cp_tilt))
-
-    def _buy(self, price: int, volume: int) -> None:
-        vol = min(volume, self.max_buy)
-        if vol <= 0:
-            return
-        self.orders.append(Order(self.name, price, vol))
-        self.max_buy -= vol
-        self.pos     += vol
-
-    def _sell(self, price: int, volume: int) -> None:
-        vol = min(volume, self.max_sell)
-        if vol <= 0:
-            return
-        self.orders.append(Order(self.name, price, -vol))
-        self.max_sell -= vol
-        self.pos      -= vol
-
-    def get_orders(self) -> Dict[str, List]:
-        diff = self.target_pos - self.pos
-
-        if abs(diff) < self.REBALANCE_THRESHOLD:
-            return {self.name: []}
-
-        if diff > 0:
-            remaining = diff
-            for sp, sv in self.asks.items():
-                if remaining <= 0:
-                    break
-                take = min(sv, remaining)
-                self._buy(sp, take)
-                remaining -= take
-        else:
-            remaining = -diff
-            for bp, bv in self.bids.items():
-                if remaining <= 0:
-                    break
-                take = min(bv, remaining)
-                self._sell(bp, take)
-                remaining -= take
 
         return {self.name: self.orders}
 
@@ -392,27 +315,29 @@ class VEVUnderlyingTrader:
 # ─────────────────────────────────────────────────────────────────────────────
 #  VEV OPTIONS — TAKE-ONLY seller (intrinsic-floor + T-sanity check)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+#  Round 4 mispricing pattern (from EDA):
+#    Day 1 (T: 3→2): market BELOW BS by 3-5 ticks → threshold=10 blocks selling cheap
+#    Day 2 (T: 2→1): market ABOVE BS by +6-8 ticks → sell when bid > BS+5
+#    Day 3 (T: 1→0): market ABOVE BS by +20-22 ticks → sell aggressively, bid > BS+5
+#
+#  Intrinsic floor always active: sell only if bid > intrinsic + 5.
+#  This guarantees profit at settlement regardless of T_remaining accuracy.
+#
+#  NO delta hedge: log 509764 showed the hedge cost -8405, options earned +5664.
+#  On day 3 with T→0, OTM delta < 0.1, hedge spread cost > hedge benefit.
+#  Delta-neutral is only valuable if you can earn theta. Here we collect premium
+#  via the sell-at-expiry structure — no ongoing theta capture needed.
 
 def _take_threshold(T_remaining: float) -> float:
-    # T>2.0 = day 1: market is below BS → high threshold prevents selling cheap options
-    # T≤2.0 = days 2-3: market is above BS → sell when overpriced by ≥5 ticks
     if T_remaining > 2.0:
-        return 10.0
-    return 5.0
+        return 10.0   # day 1: market below BS, high threshold blocks selling cheap
+    return 5.0         # days 2-3: market above BS, aggressive
 
 
 class VEVOptionSeller:
     """
-    TAKE-ONLY options seller for overpriced calls.
-
-    Two-regime sell trigger (T-robust):
-      Normal T  → sell when bid > BS_fair + threshold
-      Inflated T (BS_fair / market_mid > 1.10) → sell when bid > intrinsic + 5
-
-    Round 4 enhancements:
-      - Higher position limits (300) → higher OPTION_MAX_SHORT caps
-      - Option_max_short values increased proportionally vs R3
-      - No change to logic (pattern identical to R3: +12/+27 mispricing holds)
+    TAKE-ONLY options seller. No delta hedge (removed after log 509764 analysis).
     """
 
     def __init__(
@@ -443,14 +368,11 @@ class VEVOptionSeller:
             self.asks = {p: abs(v) for p, v in sorted(od.sell_orders.items(), key=lambda x:  x[0]) if v}
 
         self.fair: Optional[float] = None
-        self.delta: float = 0.0
         if self.S is not None:
             if T_remaining > 0:
-                self.fair  = _bs_call(self.S, self.strike, T_remaining, SIGMA)
-                self.delta = _bs_delta(self.S, self.strike, T_remaining, SIGMA)
+                self.fair = _bs_call(self.S, self.strike, T_remaining, SIGMA)
             else:
-                self.fair  = max(float(self.S - self.strike), 0.0)
-                self.delta = 1.0 if self.S > self.strike else 0.0
+                self.fair = max(float(self.S - self.strike), 0.0)
 
         self.threshold        = _take_threshold(T_remaining)
         self.max_option_short = OPTION_MAX_SHORT.get(strike, 75)
@@ -485,6 +407,8 @@ class VEVOptionSeller:
         if self.bids and self.asks:
             market_mid = (next(iter(self.bids)) + next(iter(self.asks))) / 2.0
 
+        # T-sanity: if BS(T) >> market_mid, T_remaining is likely wrong (day_offset error).
+        # Fall back to intrinsic floor — guaranteed profitable at settlement.
         t_inflated = (
             self.fair is not None
             and market_mid is not None
@@ -498,12 +422,13 @@ class VEVOptionSeller:
         else:
             sell_trigger = sell_floor
 
+        # SELL: hit bids above trigger
         for bp, bv in self.bids.items():
             if bp < sell_trigger:
                 break
             self._sell(bp, bv)
 
-        # Cover: only at ask ≤ intrinsic (never pay time value)
+        # COVER: buy back only at intrinsic (never pay time value)
         for sp, sv in self.asks.items():
             if sp > intrinsic:
                 break
@@ -518,23 +443,40 @@ class VEVOptionSeller:
 
 class Trader:
     """
-    Round 4 — single-file Trader (platform requires one file).
+    Round 4 — rebuilt after log 509764 forensic analysis.
+
+    Changes from previous version:
+      - ProductTrader cross-update bug FIXED (no more limit exceeded errors)
+      - HYDROGEL FV now adaptive (EMA of market mid, not static 9995)
+      - Delta hedge REMOVED (cost -8405 vs options +5664 in log 509764)
+      - Day detection improved: uses option price sanity check as fallback
+      - VEVUnderlyingTrader class removed entirely
 
     Execution order each tick:
-      1. Decode traderData
-      2. Track day_offset for T_remaining
-      3. Read VELVETFRUIT_EXTRACT mid price
-      4. HYDROGEL_PACK — position-aware mean-reversion + counterparty bias
-      5. VEV_5200-5500 — TAKE-ONLY option selling (same as R3, updated limits)
-      6. VELVETFRUIT_EXTRACT — delta hedge + counterparty tilt (NEW in R4)
-      7. Encode state
+      1. Decode state, track day_offset
+      2. Sanity-check T_remaining against option market prices
+      3. HYDROGEL — adaptive mean-reversion (adaptive FV, fixed limits)
+      4. VEV options — TAKE-ONLY selling (intrinsic-floor + BS trigger)
     """
 
-    def _get_day_offset(self, state: TradingState, last_td: dict) -> int:
+    def _get_day_offset(self, state: TradingState, last_td: dict,
+                         underlying_mid: Optional[float]) -> int:
         last_ts    = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
         day_offset = last_td.get("_meta", {}).get("day_offset", 0)
+
         if state.timestamp < last_ts:
             day_offset += 1
+
+        # Sanity-check: if T_remaining implied by day_offset seems inconsistent
+        # with option market prices, override with estimate from option prices.
+        # This handles the "fresh start on day 3" failure from log 509764.
+        T_implied = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
+        if T_implied > 2.0 and underlying_mid is not None:
+            # Our T estimate says day 1, but let's verify against VEV_5300 price
+            est_offset = _detect_day_from_options(state, underlying_mid)
+            if est_offset is not None and est_offset > day_offset:
+                day_offset = est_offset
+
         return day_offset
 
     def _get_underlying_mid(self, state: TradingState) -> Optional[float]:
@@ -555,24 +497,21 @@ class Trader:
         new_td = default_traderData()
         new_td.setdefault("_meta", {})
 
-        # 2. Time tracking
-        day_offset = self._get_day_offset(state, last_td)
+        # 2. Underlying mid (needed for day detection)
+        underlying_mid = self._get_underlying_mid(state)
+
+        # 3. Time tracking with option-price sanity check
+        day_offset = self._get_day_offset(state, last_td, underlying_mid)
         new_td["_meta"]["day_offset"]     = day_offset
         new_td["_meta"]["last_timestamp"] = state.timestamp
         T_remaining = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
 
-        # 3. Underlying mid
-        underlying_mid = self._get_underlying_mid(state)
-
-        # 4. HYDROGEL_PACK
+        # 4. HYDROGEL_PACK — adaptive mean-reversion
         hg = HydrogelTrader("HYDROGEL_PACK", state, last_td, new_td)
         result.update(hg.get_orders())
         hg.update_traderData()
 
-        # 5. VEV options — TAKE-ONLY selling, collect deltas for hedge
-        option_positions: Dict[int, int]   = {}
-        option_deltas:    Dict[int, float] = {}
-
+        # 5. VEV options — TAKE-ONLY selling, no delta hedge
         if underlying_mid is not None:
             for K in SELL_STRIKES:
                 name = f"VEV_{K}"
@@ -587,17 +526,6 @@ class Trader:
                     position_limit=POS_LIMITS.get(name, 300),
                 )
                 result.update(seller.get_orders())
-                option_positions[K] = state.position.get(name, 0)
-                option_deltas[K]    = seller.delta
 
-        # 6. VELVETFRUIT_EXTRACT — delta hedge + counterparty signal (NEW)
-        if underlying_mid is not None:
-            vev_trader = VEVUnderlyingTrader(
-                state=state,
-                option_positions=option_positions,
-                option_deltas=option_deltas,
-            )
-            result.update(vev_trader.get_orders())
-
-        # 7. Save state
+        # 6. Save state
         return result, 0, jsonpickle.encode(new_td)
