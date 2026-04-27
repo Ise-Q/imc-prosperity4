@@ -1,12 +1,12 @@
 """
-Round 3 EDA — IMC Prosperity 4
+Round 4 EDA — IMC Prosperity 4
 ================================
 Products: VELVETFRUIT_EXTRACT, VEV_4000-6500 (call options), HYDROGEL_PACK
-Focus: voucher (options) mispricing, HYDROGEL mean-reversion, signal extraction.
+Round 4 new feature: buyer/seller IDs on market trades.
 
 Usage:
-    python round3_EDA.py               # generates plots + prints stats
-    python round3_EDA.py --no-plots    # stats only (faster)
+    python round4_EDA.py               # full analysis + plots
+    python round4_EDA.py --no-plots    # stats only
 """
 
 import argparse
@@ -18,18 +18,19 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
-matplotlib.use("Agg")  # headless rendering
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR  = "./data"
-OUT_DIR   = "./eda_output"
-DAYS      = [0, 1, 2]
-STRIKES   = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
-VEV_COLS  = [f"VEV_{k}" for k in STRIKES]
-PRODUCTS  = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_COLS
+DATA_DIR      = "../data"
+OUT_DIR       = "../eda_output_r4"
+DAYS          = [1, 2, 3]   # Round 4 uses days 1,2,3 (vs 0,1,2 in R3)
+STRIKES       = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+VEV_COLS      = [f"VEV_{k}" for k in STRIKES]
+PRODUCTS      = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_COLS
 TICKS_PER_DAY = 10_000
 TOTAL_DAYS    = 3.0
+PARTICIPANTS  = ["Mark 01", "Mark 14", "Mark 22", "Mark 38", "Mark 49", "Mark 55", "Mark 67"]
 
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
@@ -41,7 +42,7 @@ def norm_cdf(x: float) -> float:
 def bs_call(S: float, K: float, T: float, sigma: float) -> float:
     if T <= 0 or sigma <= 0:
         return max(float(S - K), 0.0)
-    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return S * norm_cdf(d1) - K * norm_cdf(d2)
 
@@ -49,7 +50,7 @@ def bs_call(S: float, K: float, T: float, sigma: float) -> float:
 def bs_delta(S: float, K: float, T: float, sigma: float) -> float:
     if T <= 0:
         return 1.0 if S > K else 0.0
-    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
     return norm_cdf(d1)
 
 
@@ -58,13 +59,26 @@ def bs_delta(S: float, K: float, T: float, sigma: float) -> float:
 def load_prices() -> pd.DataFrame:
     dfs = []
     for d in DAYS:
-        p = pd.read_csv(f"{DATA_DIR}/prices_round_3_day_{d}.csv", sep=";")
+        p = pd.read_csv(f"{DATA_DIR}/prices_round_4_day_{d}.csv", sep=";")
         p["day"] = d
         dfs.append(p)
     prices = pd.concat(dfs, ignore_index=True)
-    prices["elapsed"] = prices["day"] + prices["timestamp"] / 1_000_000
-    prices["T_remaining"] = TOTAL_DAYS - prices["elapsed"]
+    # elapsed: day 1 tick 0 → elapsed=1.0, day 3 tick 1e6 → elapsed=4.0
+    # T_remaining: options expire at T=0, which is elapsed=3.0 (end of day 2)
+    prices["elapsed"]     = prices["day"] + prices["timestamp"] / 1_000_000
+    prices["T_remaining"] = TOTAL_DAYS - (prices["day"] - 1 + prices["timestamp"] / 1_000_000)
     return prices
+
+
+def load_trades() -> pd.DataFrame:
+    dfs = []
+    for d in DAYS:
+        t = pd.read_csv(f"{DATA_DIR}/trades_round_4_day_{d}.csv", sep=";")
+        t["day"] = d
+        dfs.append(t)
+    trades = pd.concat(dfs, ignore_index=True)
+    trades["elapsed"] = trades["day"] + trades["timestamp"] / 1_000_000
+    return trades
 
 
 def pivot_mid(prices: pd.DataFrame) -> pd.DataFrame:
@@ -83,16 +97,93 @@ def pivot_mid(prices: pd.DataFrame) -> pd.DataFrame:
     return mid
 
 
-def load_trades() -> pd.DataFrame:
-    dfs = []
-    for d in DAYS:
-        t = pd.read_csv(f"{DATA_DIR}/trades_round_3_day_{d}.csv", sep=";")
-        t["day"] = d
-        dfs.append(t)
-    return pd.concat(dfs, ignore_index=True)
+# ── Counterparty analysis ─────────────────────────────────────────────────────
+
+def counterparty_price_impact(trades: pd.DataFrame, prices: pd.DataFrame,
+                               symbol: str, lag: int = 1000) -> pd.DataFrame:
+    """
+    Compute price impact at +lag ticks for each participant trading symbol.
+    Positive = profitable direction (bought before price rose, or sold before fell).
+    """
+    prod_t = trades[trades["symbol"] == symbol].copy()
+    prod_p = prices[prices["product"] == symbol][["day", "timestamp", "mid_price"]].copy()
+
+    prod_t = prod_t.merge(prod_p.rename(columns={"mid_price": "mid_at"}),
+                          on=["day", "timestamp"], how="left")
+
+    future = prod_p.copy()
+    future["timestamp"] = future["timestamp"] - lag
+    future = future.rename(columns={"mid_price": f"mid_{lag}"})
+    prod_t = prod_t.merge(future, on=["day", "timestamp"], how="left")
+
+    rows = []
+    for p in PARTICIPANTS:
+        b = prod_t[prod_t["buyer"] == p]
+        s = prod_t[prod_t["seller"] == p]
+        b_impact = (b[f"mid_{lag}"] - b["price"]).dropna()
+        s_impact = (s["price"] - s[f"mid_{lag}"]).dropna()
+        combined = pd.concat([b_impact, s_impact])
+        if combined.empty:
+            continue
+        rows.append({
+            "participant": p,
+            "n_trades":   len(combined),
+            "avg_impact": combined.mean(),
+            "win_rate":   (combined > 0).mean(),
+            "n_buys":     len(b),
+            "n_sells":    len(s),
+            "avg_buy_price":  b["price"].mean() if len(b) else float("nan"),
+            "avg_sell_price": s["price"].mean() if len(s) else float("nan"),
+        })
+    return pd.DataFrame(rows).set_index("participant")
 
 
-# ── Analysis functions ────────────────────────────────────────────────────────
+def print_counterparty_summary(trades: pd.DataFrame, prices: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print("  COUNTERPARTY ANALYSIS — Round 4")
+    print("=" * 70)
+
+    # Overall role
+    print("\n=== Role summary (all products) ===")
+    print(f"{'':12} {'buy_trades':>11} {'sell_trades':>12} {'qty_bought':>12} {'qty_sold':>10}")
+    for p in PARTICIPANTS:
+        b = trades[trades["buyer"]  == p]
+        s = trades[trades["seller"] == p]
+        print(f"  {p:<10} {len(b):>11} {len(s):>12} {b['quantity'].sum():>12.0f} {s['quantity'].sum():>10.0f}")
+
+    # Price impact per product
+    for prod, lag in [("VELVETFRUIT_EXTRACT", 1000), ("HYDROGEL_PACK", 1000)]:
+        df = counterparty_price_impact(trades, prices, prod, lag)
+        if df.empty:
+            continue
+        print(f"\n=== {prod} price impact at +{lag} ticks ===")
+        print(f"{'':12} {'n_trades':>9} {'avg_impact':>11} {'win_rate':>10}")
+        for p, row in df.iterrows():
+            print(f"  {p:<10} {row['n_trades']:>9.0f} {row['avg_impact']:>+11.2f} {row['win_rate']*100:>9.0f}%")
+
+    # HYDROGEL pair analysis
+    hyd = trades[trades["symbol"] == "HYDROGEL_PACK"]
+    print("\n=== HYDROGEL — who trades with whom? ===")
+    pairs = hyd.groupby(["buyer", "seller"])["quantity"].sum().reset_index()
+    print(pairs.sort_values("quantity", ascending=False).to_string(index=False))
+
+    print("\n=== Counterparty behavioral archetypes ===")
+    print("  Mark 01 : INFORMED BUYER — VEV underlying (83% win), systematic call buyer")
+    print("  Mark 14 : PROFITABLE MM  — HYDROGEL buys FV-8/sells FV+8 (90% win)")
+    print("  Mark 22 : OPTION SELLER  — systematic call seller (our competitor)")
+    print("  Mark 38 : SYSTEMATIC LOSER — HYDROGEL buys FV+8/sells FV-8 (9% win) → FADE")
+    print("  Mark 49 : NOISE TRADER   — VEV, 33% win rate → FADE")
+    print("  Mark 55 : LIQUIDITY      — VEV, ~50/50, slight adverse to informed")
+    print("  Mark 67 : DIRECTIONAL    — pure buyer VEV (never sells), bullish momentum")
+
+    # Options flow
+    print("\n=== Option call buyers (who is net long calls?) ===")
+    opt_t = trades[trades["symbol"].str.startswith("VEV_")]
+    opt_buyers = opt_t.groupby(["buyer", "symbol"])["quantity"].sum().unstack(fill_value=0)
+    print(opt_buyers.to_string())
+
+
+# ── Calibration ───────────────────────────────────────────────────────────────
 
 def calibrate_sigma(mid: pd.DataFrame) -> float:
     S = mid["VELVETFRUIT_EXTRACT"].dropna()
@@ -100,8 +191,7 @@ def calibrate_sigma(mid: pd.DataFrame) -> float:
     return float(log_ret.std() * np.sqrt(TICKS_PER_DAY))
 
 
-def compute_bs_mispricing(mid: pd.DataFrame, sigma: float, sample_every: int = 100) -> pd.DataFrame:
-    """Compute BS fair value and mispricing for all strikes at sampled timestamps."""
+def compute_mispricing(mid: pd.DataFrame, sigma: float, sample_every: int = 100) -> pd.DataFrame:
     sample = mid.iloc[::sample_every].copy()
     rows = []
     for _, row in sample.iterrows():
@@ -114,26 +204,25 @@ def compute_bs_mispricing(mid: pd.DataFrame, sigma: float, sample_every: int = 1
             mkt = row.get(col, float("nan"))
             if math.isnan(mkt):
                 continue
-            bs = bs_call(S, K, T, sigma)
+            fair  = bs_call(S, K, T, sigma)
             delta = bs_delta(S, K, T, sigma)
             rows.append({
-                "elapsed": row["elapsed"],
-                "day": row["day"],
+                "elapsed":     row["elapsed"],
+                "day":         row["day"],
                 "T_remaining": T,
-                "strike": K,
-                "S": S,
-                "mkt": mkt,
-                "bs": bs,
-                "misprice": mkt - bs,
-                "moneyness": S / K,
-                "delta": delta,
+                "strike":      K,
+                "S":           S,
+                "mkt":         mkt,
+                "bs":          fair,
+                "misprice":    mkt - fair,
+                "delta":       delta,
             })
     return pd.DataFrame(rows)
 
 
 def print_mispricing_summary(opts: pd.DataFrame) -> None:
-    print("\n=== Mispricing (mkt - BS) by strike and day ===")
-    print(f"{'Strike':>8}  {'Day':>4}  {'Mean':>8}  {'P25':>7}  {'P75':>7}  {'Min':>8}  {'Max':>8}")
+    print("\n=== Options mispricing (mkt - BS) by strike and day ===")
+    print(f"{'Strike':>8}  {'Day':>4}  {'Mean':>8}  {'P25':>7}  {'P75':>7}")
     for K in STRIKES:
         sub = opts[opts["strike"] == K]
         if sub.empty:
@@ -143,105 +232,58 @@ def print_mispricing_summary(opts: pd.DataFrame) -> None:
             if s.empty:
                 continue
             print(f"  K={K:5d}  day={d}  mean={s.mean():+7.2f}"
-                  f"  p25={s.quantile(.25):+6.2f}  p75={s.quantile(.75):+6.2f}"
-                  f"  min={s.min():+7.2f}  max={s.max():+7.2f}")
+                  f"  p25={s.quantile(.25):+6.2f}  p75={s.quantile(.75):+6.2f}")
 
 
 def print_hydrogel_stats(prices: pd.DataFrame) -> None:
-    hyd = prices[prices["product"] == "HYDROGEL_PACK"].copy()
-    hyd = hyd.sort_values("elapsed")
-    s = hyd["mid_price"]
+    hyd = prices[prices["product"] == "HYDROGEL_PACK"]["mid_price"]
     print("\n=== HYDROGEL_PACK statistics ===")
-    print(f"  Mean  = {s.mean():.2f}  Std = {s.std():.2f}")
-    print(f"  Min   = {s.min():.0f}   Max = {s.max():.0f}")
+    print(f"  Mean = {hyd.mean():.2f}  Std = {hyd.std():.2f}")
+    print(f"  Range = [{hyd.min():.0f}, {hyd.max():.0f}]")
 
-    # OU half-life
-    vals = s.dropna().values
+    vals = hyd.dropna().values
     dX   = np.diff(vals)
     X    = vals[:-1]
     A    = np.column_stack([np.ones(len(X)), X])
     from numpy.linalg import lstsq
-    coeffs, _, _, _ = lstsq(A, dX, rcond=None)
-    theta = -coeffs[1]
-    mu    = coeffs[0] / theta if theta > 0 else s.mean()
+    c, _, _, _ = lstsq(A, dX, rcond=None)
+    theta = -c[1]
+    mu    = c[0] / theta if theta > 0 else hyd.mean()
     hl    = math.log(2) / theta if theta > 0 else None
-    print(f"  OU mu = {mu:.2f}  theta = {theta:.5f}  half-life = {hl:.1f} ticks" if hl else "  No OU fit")
+    print(f"  OU: mu={mu:.2f}, theta={theta:.5f}, half-life={hl:.1f} ticks" if hl else "  No OU fit")
 
-    # Spread
     sub = prices[(prices["product"] == "HYDROGEL_PACK") & prices["bid_price_1"].notna()].copy()
     sub["spread"] = sub["ask_price_1"] - sub["bid_price_1"]
-    print(f"  Avg bid-ask spread = {sub['spread'].mean():.2f}  (most common: {sub['spread'].mode()[0]:.0f})")
-
-    mean, std = s.mean(), s.std()
-    print(f"  1-sigma bands: ({mean-std:.0f}, {mean+std:.0f})")
-    print(f"  2-sigma bands: ({mean-2*std:.0f}, {mean+2*std:.0f})")
-    print(f"  Pct outside 1σ: {((s > mean+std) | (s < mean-std)).mean()*100:.1f}%")
-    print(f"  Pct outside 2σ: {((s > mean+2*std) | (s < mean-2*std)).mean()*100:.1f}%")
-
-
-def print_deepitm_stats(mid: pd.DataFrame) -> None:
-    print("\n=== Deep-ITM options: VEV_4000, VEV_4500 vs intrinsic ===")
-    for K in [4000, 4500]:
-        col = f"VEV_{K}"
-        sub = mid[["elapsed", "VELVETFRUIT_EXTRACT", col]].dropna()
-        intrinsic = sub["VELVETFRUIT_EXTRACT"] - K
-        diff = sub[col] - intrinsic
-        print(f"  VEV_{K}: price - (S-K)  mean={diff.mean():.3f}  std={diff.std():.3f}")
-        print(f"    Corr(VEV_{K}, S) = {sub['VELVETFRUIT_EXTRACT'].corr(sub[col]):.6f}")
-
-
-def print_strategy_thresholds(opts: pd.DataFrame, sigma: float) -> None:
-    """Compute optimal sell-threshold candidates per strike and day."""
-    print("\n=== Suggested SELL thresholds (mkt - BS must exceed X to sell) ===")
-    print(f"{'Strike':>8}  {'Day 0':>8}  {'Day 1':>8}  {'Day 2':>8}  "
-          f"{'p10 D0':>8}  {'p10 D1':>8}  {'p10 D2':>8}")
-    for K in [5000, 5100, 5200, 5300, 5400, 5500]:
-        col = f"VEV_{K}"
-        sub = opts[opts["strike"] == K]
-        line = f"  K={K:5d} "
-        p10_vals = []
-        mean_vals = []
-        for d in DAYS:
-            s = sub[sub["day"] == d]["misprice"]
-            if s.empty:
-                line += f"  {'n/a':>7}"
-                p10_vals.append(float("nan"))
-                mean_vals.append(float("nan"))
-            else:
-                line += f"  {s.mean():+7.2f}"
-                p10_vals.append(s.quantile(0.10))
-                mean_vals.append(s.mean())
-        for v in p10_vals:
-            line += f"  {v:+7.2f}" if not math.isnan(v) else f"  {'n/a':>7}"
-        print(line)
-    print("\nRecommendation:")
-    print("  Day 0: take_margin=10 (misprice too small/noisy to trade reliably)")
-    print("  Day 1: take_margin=5  (consistent +12-13 tick misprice for K=5200-5300)")
-    print("  Day 2: take_margin=5  (consistent +27-30 tick misprice — sell aggressively)")
-    print("  make_margin: DISABLED (passive quoting causes immediate adverse fills)")
+    print(f"  Avg spread = {sub['spread'].mean():.2f}  (mode: {sub['spread'].mode()[0]:.0f})")
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_underlying(mid: pd.DataFrame, out: str) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 4), sharey=True)
-    for d, ax in enumerate(axes):
-        sub = mid[mid["day"] == d]
-        ax.plot(sub["timestamp"], sub["VELVETFRUIT_EXTRACT"], lw=0.6, color="steelblue")
-        ax.set_title(f"Day {d}")
-        ax.set_xlabel("Timestamp")
-    axes[0].set_ylabel("VELVETFRUIT_EXTRACT mid")
-    fig.suptitle("Underlying mid price per day", fontsize=12)
+def plot_counterparty_impact(trades: pd.DataFrame, prices: pd.DataFrame, out: str) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, (prod, lag) in zip(axes, [("VELVETFRUIT_EXTRACT", 1000), ("HYDROGEL_PACK", 1000)]):
+        df = counterparty_price_impact(trades, prices, prod, lag)
+        if df.empty:
+            continue
+        df_plot = df.sort_values("avg_impact", ascending=False)
+        colors = ["steelblue" if x >= 0 else "tomato" for x in df_plot["avg_impact"]]
+        ax.barh(df_plot.index, df_plot["avg_impact"], color=colors, edgecolor="none")
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_title(f"{prod}\nPrice impact at +{lag} ticks")
+        ax.set_xlabel("Avg profit per trade (ticks)")
+
+    fig.suptitle("Counterparty Price Impact — Round 4", fontsize=12)
     plt.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close()
 
 
-def plot_mispricing_by_day(opts: pd.DataFrame, sigma: float, out: str) -> None:
+def plot_mispricing(opts: pd.DataFrame, sigma: float, out: str) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    key_strikes = [5000, 5100, 5200, 5300, 5400, 5500]
-    colors = plt.cm.tab10(np.linspace(0, 0.6, len(key_strikes)))
-    for d, ax in enumerate(axes):
+    key_strikes = [5200, 5300, 5400, 5500]
+    colors = plt.cm.tab10(np.linspace(0, 0.4, len(key_strikes)))
+    for d, ax in zip(DAYS, axes):
         sub = opts[opts["day"] == d]
         for i, K in enumerate(key_strikes):
             s = sub[sub["strike"] == K].sort_values("elapsed")
@@ -250,10 +292,10 @@ def plot_mispricing_by_day(opts: pd.DataFrame, sigma: float, out: str) -> None:
             ax.plot(s["elapsed"], s["misprice"], lw=0.7, label=f"K={K}", color=colors[i])
         ax.axhline(0, color="black", lw=0.8, ls="--")
         ax.set_title(f"Day {d}")
-        ax.set_xlabel("Elapsed days")
-    axes[0].set_ylabel("Mkt - BS price (ticks)")
+        ax.set_xlabel("Elapsed")
+    axes[0].set_ylabel("Mkt - BS (ticks)")
     axes[0].legend(fontsize=7)
-    fig.suptitle(f"Options mispricing (market - BS)  sigma={sigma:.5f}", fontsize=12)
+    fig.suptitle(f"Options mispricing  sigma={sigma:.5f}", fontsize=12)
     plt.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close()
@@ -264,60 +306,13 @@ def plot_hydrogel(mid: pd.DataFrame, out: str) -> None:
     mu  = h["HYDROGEL_PACK"].mean()
     std = h["HYDROGEL_PACK"].std()
     fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(h["elapsed"], h["HYDROGEL_PACK"], lw=0.4, color="teal", label="HYDROGEL")
-    for mult, label, c in [(1, "±1σ", "red"), (2, "±2σ", "darkred")]:
-        ax.axhline(mu + mult * std, ls="--", color=c, lw=0.8, label=label if mult == 1 else "")
+    ax.plot(h["elapsed"], h["HYDROGEL_PACK"], lw=0.4, color="teal")
+    for mult, c in [(1, "red"), (2, "darkred")]:
+        ax.axhline(mu + mult * std, ls="--", color=c, lw=0.8)
         ax.axhline(mu - mult * std, ls="--", color=c, lw=0.8)
     ax.axhline(mu, ls="-", color="black", lw=1.0, label=f"Mean={mu:.0f}")
     ax.set_title("HYDROGEL_PACK mean-reversion bands")
-    ax.set_xlabel("Elapsed days")
-    ax.set_ylabel("Price")
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close()
-
-
-def plot_iv_smile(opts: pd.DataFrame, sigma: float, out: str) -> None:
-    avg_iv = opts.groupby(["day", "strike"])["misprice"].mean().reset_index()
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
-    for d, ax in enumerate(axes):
-        sub = avg_iv[avg_iv["day"] == d]
-        ax.bar(sub["strike"], sub["misprice"], color="steelblue", edgecolor="none", alpha=0.8)
-        ax.axhline(0, color="black", lw=0.8)
-        ax.set_title(f"Day {d} — avg misprice by strike")
-        ax.set_xlabel("Strike")
-    axes[0].set_ylabel("Avg misprice (mkt - BS)")
-    fig.suptitle("Options average mispricing per day and strike", fontsize=12)
-    plt.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close()
-
-
-def plot_delta_profile(opts: pd.DataFrame, out: str) -> None:
-    fig, ax = plt.subplots(figsize=(14, 4))
-    for K in STRIKES:
-        sub = opts[opts["strike"] == K].sort_values("elapsed")
-        ax.plot(sub["elapsed"], sub["delta"], lw=0.6, label=f"K={K}")
-    ax.set_title("BS Delta by strike over time")
-    ax.set_xlabel("Elapsed days")
-    ax.set_ylabel("Delta (0–1)")
-    ax.legend(fontsize=7, ncol=2)
-    plt.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close()
-
-
-def plot_volatility(mid: pd.DataFrame, sigma: float, out: str) -> None:
-    S = mid.set_index("elapsed")["VELVETFRUIT_EXTRACT"].dropna()
-    log_ret = np.log(S / S.shift(1)).dropna()
-    rolling = log_ret.rolling(TICKS_PER_DAY).std() * np.sqrt(TICKS_PER_DAY)
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(rolling.index, rolling, lw=0.7, color="steelblue", label="Rolling sigma")
-    ax.axhline(sigma, ls="--", color="tomato", lw=1.2, label=f"Full-sample sigma={sigma:.5f}")
-    ax.set_title("Rolling realized volatility (1-day window)")
-    ax.set_ylabel("Sigma (comp-annual)")
-    ax.legend()
+    ax.set_xlabel("Elapsed"); ax.set_ylabel("Price"); ax.legend(fontsize=8)
     plt.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close()
@@ -332,87 +327,31 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    print("Loading data...")
+    print("Loading Round 4 data...")
     prices = load_prices()
     mid    = pivot_mid(prices)
     trades = load_trades()
     print(f"  Price rows : {len(prices):,}   Trade rows : {len(trades):,}")
 
-    # ── Sigma calibration ─────────────────────────────────────────────────────
     sigma = calibrate_sigma(mid)
     print(f"\n=== Sigma calibration ===")
-    print(f"  Realized sigma (comp-annual) = {sigma:.5f}")
-    print(f"  Underlying mean  = {mid['VELVETFRUIT_EXTRACT'].mean():.2f}")
-    print(f"  Underlying range = [{mid['VELVETFRUIT_EXTRACT'].min():.0f}, {mid['VELVETFRUIT_EXTRACT'].max():.0f}]")
+    print(f"  Round 4 sigma = {sigma:.5f}  (Round 3 was 0.02155)")
+    print(f"  VEV mean = {mid['VELVETFRUIT_EXTRACT'].mean():.2f}")
 
-    # ── HYDROGEL ──────────────────────────────────────────────────────────────
     print_hydrogel_stats(prices)
 
-    # ── Deep-ITM options ──────────────────────────────────────────────────────
-    print_deepitm_stats(mid)
+    print_counterparty_summary(trades, prices)
 
-    # ── Options mispricing ────────────────────────────────────────────────────
-    print("\nComputing BS mispricing (sampling every 100 rows)...")
-    opts = compute_bs_mispricing(mid, sigma, sample_every=100)
+    print("\nComputing BS mispricing...")
+    opts = compute_mispricing(mid, sigma, sample_every=100)
     print_mispricing_summary(opts)
-    print_strategy_thresholds(opts, sigma)
 
-    # ── Hypothesis summary ────────────────────────────────────────────────────
-    print("\n" + "=" * 65)
-    print("  HYPOTHESIS SUMMARY")
-    print("=" * 65)
-    print("""
-Pattern 1 — Options Systematic Overpricing (HIGH CONFIDENCE)
-  Type: Options mispricing / mean reversion to intrinsic at expiry
-  Signal: market bid - BS fair > threshold
-  Day 0: noisy, threshold=10 (trade sparingly)
-  Day 1: consistent +12-13 ticks for K=5200-5300 → threshold=5
-  Day 2: consistent +27-30 ticks for K=5200-5300 → threshold=5
-  Action: SELL calls when overpriced, hold to expiry (T→0 → intrinsic)
-  Risk: underlying directional move; mitigate via delta hedge
-
-Pattern 2 — HYDROGEL Mean Reversion (HIGH CONFIDENCE)
-  Type: Mean reversion / Ornstein-Uhlenbeck
-  Signal: price deviation from mu=9991 (1-sigma=31.94)
-  Half-life ≈ 301 ticks; spread = 16 ticks (cost to cross)
-  Action: buy below fair-2, sell above fair+2, clear at fair+4
-  Current strategy already profitable (+15,633 baseline)
-
-Pattern 3 — Deep-ITM Options as Underlying Proxies (MEDIUM)
-  Type: Delta-1 arbitrage / market-making
-  VEV_4000, VEV_4500: correlation(price, S-K) > 0.998
-  Mean deviation from (S-K) = 0.01 ticks
-  Action: market-make same way as underlying
-
-Pattern 4 — Delta Hedging of Short Option Book (STRUCTURAL)
-  Type: Risk management (not alpha source)
-  When short calls, buy underlying to neutralize delta exposure
-  Net portfolio delta should stay near 0
-""")
-
-    # ── Plots ─────────────────────────────────────────────────────────────────
     if not args.no_plots:
-        print("Generating plots...")
-        plot_underlying(mid, f"{OUT_DIR}/01_underlying.png")
-        plot_volatility(mid, sigma, f"{OUT_DIR}/02_volatility.png")
-        plot_mispricing_by_day(opts, sigma, f"{OUT_DIR}/03_mispricing_by_day.png")
-        plot_hydrogel(mid, f"{OUT_DIR}/04_hydrogel_bands.png")
-        plot_iv_smile(opts, sigma, f"{OUT_DIR}/05_mispricing_bar.png")
-        plot_delta_profile(opts, f"{OUT_DIR}/06_delta_profile.png")
-        print(f"  Plots saved to: {OUT_DIR}/")
-
-    # ── Save summary CSV ──────────────────────────────────────────────────────
-    summary = opts.groupby(["day", "strike"]).agg(
-        avg_misprice=("misprice", "mean"),
-        std_misprice=("misprice", "std"),
-        p10_misprice=("misprice", lambda x: x.quantile(0.10)),
-        p90_misprice=("misprice", lambda x: x.quantile(0.90)),
-        avg_delta=("delta", "mean"),
-        n_obs=("misprice", "count"),
-    ).round(3)
-    csv_path = f"{OUT_DIR}/mispricing_summary.csv"
-    summary.to_csv(csv_path)
-    print(f"\nSummary saved to: {csv_path}")
+        print("\nGenerating plots...")
+        plot_counterparty_impact(trades, prices, f"{OUT_DIR}/01_counterparty_impact.png")
+        plot_mispricing(opts, sigma, f"{OUT_DIR}/02_mispricing.png")
+        plot_hydrogel(mid, f"{OUT_DIR}/03_hydrogel.png")
+        print(f"  Plots saved to {OUT_DIR}/")
 
 
 if __name__ == "__main__":
