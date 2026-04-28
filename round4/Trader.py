@@ -1,531 +1,429 @@
 from datamodel import TradingState, Order
-from typing import Dict, List, Optional
+from typing import Dict, List
 import jsonpickle
 import math
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROUND 4 — rebuilt after log 509764 forensic analysis
+#  ROUND 4 — Hybrid strategy (best elements of A + B)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  Root causes fixed vs 509764:
-#    BUG 1 — ProductTrader cross-update: buy() was adding to max_allowed_sell_volume
-#             and sell() was adding to max_allowed_buy_volume. This caused total orders
-#             to exceed position limits every tick. Platform rejected ALL HYDROGEL orders.
-#             Fix: each side's allowance only decreases, never cross-increments.
+#  Decision basis (forensic analysis of logs 511565 vs 538153):
 #
-#    BUG 2 — Delta hedge destruction: buying 181 VEV at 5299 with wrong T=3.0 deltas
-#             into a -42 tick fall. Cost -8405. Options only +5664. Net -2741.
-#             Fix: DISABLE delta hedge entirely. Options profit from theta, not delta.
-#             On day 3 (T→0), OTM delta < 0.1 → hedge spread cost > hedge benefit.
+#  Strategy A (511565) earned +73 total:
+#    - HYDROGEL: -1761 (adaptive EMA fills from Mark 14/01 — adverse selection)
+#    - Options: +1834 (correct, but missed VEV_5200 due to day detection bug)
+#    - Drawdown: -4075 (HYDROGEL position squeeze)
 #
-#    BUG 3 — HYDROGEL FV wrong: static 9995 vs actual day-3 mean 10033.5.
-#             Fix: dynamic FV from EMA of order book mid. Always stays near market.
+#  Strategy B (538153) earned +4432 total:
+#    - HYDROGEL: +228 (KF fair value, selectively fills Mark 38 only)
+#    - VEV_5300 SELL_BIAS: +3555 (200 shorts @57 avg, settled OTM at S=5253)
+#    - VEF MM: +646 (spread capture)
+#    - VEV_5000/5100 BUY_BIAS: -97 (paid 9+ ticks time value, lost at expiry)
+#    - Drawdown: -683
 #
-#    BUG 4 — Wrong T_remaining: fresh start on day 3 gave T=3.0 instead of 1.0.
-#             Fix: detect day from option market prices as sanity check.
+#  Hybrid fixes:
+#    1. Keep Strategy B's KF HYDROGEL (selective Mark 38 fills)
+#    2. Remove BUY_BIAS on VEV_5000/5100 (structural loser — time value drain)
+#    3. Keep VEV_5300 SELL_BIAS (verified alpha: OTM at expiry, full premium)
+#    4. Add VEV_5400/5500 to SELL_BIAS (verified in Strategy A: +1678 combined)
+#    5. Add VEV_5200 to SELL_BIAS (confirmed overpriced when S>5200 at expiry)
+#    6. Keep VEF MM (stable +646, low risk)
+#    7. Add OPTION_MAX_SHORT caps to prevent over-exposure
 #
-#  Products (Round 4):
-#    VELVETFRUIT_EXTRACT  — underlying, spread ~5 ticks
-#    VEV_XXXX             — call options (strikes 4000–6500), expire T=0
-#    HYDROGEL_PACK        — OU mean-reversion, but FV drifts between days
-#
-#  Position limits (Round 4):
-#    VELVETFRUIT_EXTRACT : 200
-#    HYDROGEL_PACK       : 200
-#    VEV_*               : 300
-#
-#  Counterparty profiles (from EDA + log analysis):
-#    Mark 01  — systematic call buyer (funds our option premium), VEV informed seller
-#    Mark 14  — HYDROGEL profitable MM (buys FV-8, sells FV+8), VEV informed seller
+#  Counterparty profiles (confirmed EDA + log analysis):
+#    Mark 01  — buys options aggressively (fills our sells), VEV informed seller
+#    Mark 14  — HYDROGEL profitable MM (buys FV-8, sells FV+8) — DANGEROUS fill source
 #    Mark 22  — competing option seller
-#    Mark 38  — HYDROGEL systematic loser (buys FV+8, sells FV-8, 9% win)
-#    Mark 49  — VEV noise (33% win, fade)
-#    Mark 55  — VEV liquidity/noise
-#    Mark 67  — VEV directional buyer (never sells)
+#    Mark 38  — HYDROGEL systematic loser (buys FV+8) — SAFE fill source
+#    Mark 49  — VEV noise trader (33% win rate)
+#    Mark 55  — VEV liquidity provider
+#    Mark 67  — VEV directional buyer
 
+# ── Universe ──────────────────────────────────────────────────────────────────
+UNDERLYING   = "VELVETFRUIT_EXTRACT"
+HYDROGEL     = "HYDROGEL_PACK"
 STRIKES      = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
-VEV_PRODUCTS = [f"VEV_{k}" for k in STRIKES]
-PRODUCTS     = ["VELVETFRUIT_EXTRACT", "HYDROGEL_PACK"] + VEV_PRODUCTS
+VOUCHERS     = [f"VEV_{K}" for K in STRIKES]
+ALL_PRODUCTS = [HYDROGEL, UNDERLYING] + VOUCHERS
+POS_LIMITS   = {HYDROGEL: 200, UNDERLYING: 200, **{v: 300 for v in VOUCHERS}}
 
-POS_LIMITS: Dict[str, int] = {
-    "VELVETFRUIT_EXTRACT": 200,
-    "HYDROGEL_PACK":        200,
-    **{f"VEV_{k}": 300 for k in STRIKES},
+# ── Parameters ────────────────────────────────────────────────────────────────
+HYDROGEL_PARAMS = {"make_margin": 4, "inv_beta": 8, "imb_scale": 4}
+
+VEF_PARAMS = {
+    "make_margin": 1,
+    "range_std":   15.0,
+    "range_k":     0.7,
+    "range_lean":  30,       # reduced from 40 — less directional exposure
+    "mm_size_frac": 0.20,    # reduced from 0.25 — tighter size
+    "clear_pos":   60,       # tighter clearing threshold
 }
 
-# ── Options ───────────────────────────────────────────────────────────────────
+# Implied vol smile fitted from day 1 data (calibrated for T in calendar years)
+SMILE_A = -0.0808
+SMILE_B = -0.0298
+SMILE_C = 0.2003
 
-SIGMA        = 0.02168
-EXPIRY_DAYS  = 3.0
-
-SELL_STRIKES = [5200, 5300, 5400, 5500]
-
-# Per-strike short caps. Conservative — options are the clean profit source.
-OPTION_MAX_SHORT: Dict[int, int] = {
-    5200: 75,
-    5300: 100,
-    5400: 150,
-    5500: 200,
+# Options: only trade strikes 5200-5500, all as SELL_BIAS
+# Removed VEV_5000, VEV_5100 from TRADED_VOUCHERS (BUY_BIAS loses time value)
+VOUCHER_PARAMS = {
+    "VEV_5200": {"take_margin": 6, "make_margin": 1},
+    "VEV_5300": {"take_margin": 6, "make_margin": 1},
+    "VEV_5400": {"take_margin": 6, "make_margin": 1},
+    "VEV_5500": {"take_margin": 6, "make_margin": 1},
 }
 
-# ── Counterparty IDs ──────────────────────────────────────────────────────────
-
-# HYDROGEL: Mark 38 is the systematic loser (buys FV+8, sells FV-8) — fade their flow.
-FADE_HYD = frozenset({"Mark 38"})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
-
-
-def _bs_call(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 0 or sigma <= 0:
-        return max(float(S - K), 0.0)
-    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    return S * _norm_cdf(d1) - K * _norm_cdf(d2)
-
-
-def _detect_day_from_options(state: TradingState, underlying_mid: float) -> Optional[int]:
-    """
-    Estimate day_offset from option market prices when traderData is unavailable.
-    At T=3.0: BS gives high values. At T=1.0: much lower.
-    Compare market price of VEV_5300 to BS at T=3,2,1 → pick closest.
-    Returns estimated day_offset (0, 1, or 2) or None if unable.
-    """
-    if underlying_mid is None:
-        return None
-    od = state.order_depths.get("VEV_5300")
-    if od is None:
-        return None
-    if not od.buy_orders or not od.sell_orders:
-        return None
-    mkt_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
-    if mkt_mid <= 0:
-        return None
-
-    best_offset = 0
-    best_err = float("inf")
-    for offset in [0, 1, 2]:
-        T_guess = max(EXPIRY_DAYS - offset, 0.01)
-        bs_guess = _bs_call(underlying_mid, 5300, T_guess, SIGMA)
-        err = abs(bs_guess - mkt_mid)
-        if err < best_err:
-            best_err = err
-            best_offset = offset
-    return best_offset
-
-
-def default_traderData() -> dict:
-    return {product: {} for product in PRODUCTS}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  BASE CLASS — BUG FIX: no cross-update between buy/sell allowances
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  Previous code in buy():  self.max_allowed_sell_volume += vol  (WRONG)
-#  Previous code in sell(): self.max_allowed_buy_volume  += vol  (WRONG)
-#
-#  Why it was wrong: each side's allowance is independently bounded by the
-#  position limit. After submitting sell orders, remaining sell capacity should
-#  ONLY decrease. Cross-incrementing the buy side is meaningless to the platform.
-#  The platform checks: sum(sell_orders) ≤ limit + current_pos per side.
-#  Cross-incrementing caused sum(sell_orders) > limit, rejected every tick.
-
-PARAMS = {
-    "HYDROGEL_PACK": {
-        "take_margin" : 2,
-        "clear_margin": 4,
-        "make_margin" : 3,
-        "ema_alpha"   : 0.05,   # slow EMA for adaptive FV
-    },
+# Per-strike max net short (prevents over-exposure on any single strike)
+# Based on observed market depth and delta risk
+OPTION_MAX_SHORT = {
+    "VEV_5200": 75,   # ITM at start, highest delta risk
+    "VEV_5300": 200,  # Confirmed profitable in both logs
+    "VEV_5400": 150,  # Profitable in log 511565
+    "VEV_5500": 200,  # Profitable in log 511565
 }
 
+# All traded strikes have SELL_BIAS: structural overpricing at expiry confirmed
+# VEV_5000/5100 REMOVED — paying time value that expires worthless is a loser
+SELL_BIAS      = {"VEV_5200", "VEV_5300", "VEV_5400", "VEV_5500"}
+BUY_BIAS       = set()   # empty — no buy bias anywhere
+TRADED_VOUCHERS = list(VOUCHER_PARAMS.keys())
+
+# T-remaining in calendar-year units (matches SMILE calibration)
+INITIAL_T     = 7.0 / 365.0
+STEP_SIZE_YR  = 1.0 / (250 * 10_000)
+TICKS_PER_DAY = 1_000_000
+TTE_START     = 5.0
+DAYS_PER_YEAR = 365.0
+
+
+# ── Black-Scholes ─────────────────────────────────────────────────────────────
+
+def _ncdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_call(S: float, K: float, T: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return max(S - K, 0.0)
+    v  = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / v
+    return S * _ncdf(d1) - K * _ncdf(d1 - v)
+
+
+def smile_iv(S: float, K: float, T: float) -> float:
+    if S <= 0 or K <= 0 or T <= 0:
+        return SMILE_C
+    m = math.log(K / S) / math.sqrt(T)
+    return max(0.01, SMILE_A * m * m + SMILE_B * m + SMILE_C)
+
+
+# ── Base ProductTrader ────────────────────────────────────────────────────────
+# NOTE: buy/sell do NOT cross-increment each other's capacity.
+# Each side decrements only its own cap. This avoids the position-limit
+# rejection bug from log 509764 (where cross-incrementing caused orders > limit).
 
 class ProductTrader:
-    def __init__(self, name: str, state: TradingState, last_td: dict, new_td: dict):
-        self.orders    = []
+    def __init__(self, name: str, state: TradingState, td: dict, ntd: dict, new_day: bool):
         self.name      = name
         self.state     = state
-        self.timestamp = state.timestamp
-        self.new_traderData  = new_td.setdefault(name, {})
-        self.params          = PARAMS.get(name, {})
-        self.last_traderData = last_td.get(name, {})
-        self.position_limit  = POS_LIMITS.get(name, 0)
+        self.td        = td.get(name, {})
+        self.ntd       = ntd
+        self.new_day   = new_day
+        self.orders: List[Order] = []
+        self.pos_limit = POS_LIMITS.get(name, 0)
+        self.pos       = state.position.get(name, 0)
+        self.buy_cap   = self.pos_limit - self.pos
+        self.sell_cap  = self.pos_limit + self.pos
+        od             = state.order_depths.get(name)
+        self.od        = od
+        self.bb        = max(od.buy_orders)  if od and od.buy_orders  else None
+        self.ba        = min(od.sell_orders) if od and od.sell_orders else None
+        self.mid       = (self.bb + self.ba) / 2.0 if self.bb and self.ba else None
 
-        self.starting_position = state.position.get(name, 0)
-        self.expected_position = self.starting_position
+    def buy(self, price: float, qty: float) -> None:
+        qty = min(int(abs(qty)), self.buy_cap)
+        if qty > 0:
+            self.orders.append(Order(self.name, int(price), qty))
+            self.buy_cap -= qty
 
-        self.quoted_buy_orders, self.quoted_sell_orders = self._get_order_depth()
-        # Each side is bounded independently by position limit.
-        self.max_allowed_buy_volume  = self.position_limit - self.starting_position
-        self.max_allowed_sell_volume = self.position_limit + self.starting_position
+    def sell(self, price: float, qty: float) -> None:
+        qty = min(int(abs(qty)), self.sell_cap)
+        if qty > 0:
+            self.orders.append(Order(self.name, int(price), -qty))
+            self.sell_cap -= qty
 
-    def _get_order_depth(self):
-        od = self.state.order_depths.get(self.name)
-        if od is None:
-            return {}, {}
-        buy_orders  = {p: abs(v) for p, v in sorted(od.buy_orders.items(),  key=lambda x: x[0], reverse=True) if v}
-        sell_orders = {p: abs(v) for p, v in sorted(od.sell_orders.items(), key=lambda x: x[0]) if v}
-        return buy_orders, sell_orders
+    def save(self, key: str, val) -> None:
+        self.ntd[self.name][key] = val
 
-    def get_best_bid(self) -> Optional[int]:
-        return next(iter(self.quoted_buy_orders), None)
+    def load(self, key: str, default=None):
+        return self.td.get(key, default)
 
-    def get_best_ask(self) -> Optional[int]:
-        return next(iter(self.quoted_sell_orders), None)
-
-    def buy(self, price: float, volume: float) -> None:
-        vol = min(round(abs(volume)), self.max_allowed_buy_volume)
-        if vol <= 0:
-            return
-        self.max_allowed_buy_volume -= vol
-        # FIX: do NOT touch max_allowed_sell_volume here.
-        self.orders.append(Order(self.name, round(price), vol))
-        self.expected_position += vol
-
-    def sell(self, price: float, volume: float) -> None:
-        vol = min(round(abs(volume)), self.max_allowed_sell_volume)
-        if vol <= 0:
-            return
-        self.max_allowed_sell_volume -= vol
-        # FIX: do NOT touch max_allowed_buy_volume here.
-        self.orders.append(Order(self.name, round(price), -vol))
-        self.expected_position -= vol
-
-    def update_traderData(self) -> None:
-        self.new_traderData["last_timestamp"] = self.timestamp
+    def get_orders(self) -> List[Order]:
+        raise NotImplementedError
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  HYDROGEL_PACK — adaptive FV + counterparty bias
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  FIX: FV is now an EMA of market mid, not static 9995.
-#  Root cause of failure: day 3 actual mean was 10033.5, our FV was 9995.
-#  All sell orders at 9998 never filled; all buy orders far below market.
-#
-#  Counterparty layer:
-#  Mark 38 consistently buys at FV+8 and sells at FV-8 (9% win rate).
-#  When Mark 38 is buying, price is at a local HIGH — suppress our buys.
-#  When Mark 38 is selling, price is at a local LOW — suppress our sells.
+# ── HYDROGEL Trader ───────────────────────────────────────────────────────────
+# Uses a Kalman filter for fair value estimation (adapts to drifting HYDROGEL level).
+# Key improvement over Strategy A: KF quotes inside Mark 38's range (FV±4),
+# so Mark 38 (systematic loser, buys FV+8/sells FV-8) fills us preferentially.
+# Mark 14 (smart MM) also sees our quotes but trades at FV±8 — our tighter quotes
+# should get filled by Mark 38 before Mark 14 can react.
 
 class HydrogelTrader(ProductTrader):
+    def __init__(self, state: TradingState, td: dict, ntd: dict, new_day: bool):
+        super().__init__(HYDROGEL, state, td, ntd, new_day)
+        kf_x = self.load("kf_x")
+        kf_p = self.load("kf_p", 1.0)
+        if new_day or kf_x is None:
+            kf_x = self.mid if self.mid else 9990
+            kf_p = 1.0
+        elif self.mid:
+            Q, R = 0.5, 4.0
+            kf_p = kf_p + Q
+            K    = kf_p / (kf_p + R)
+            kf_x = kf_x + K * (self.mid - kf_x)
+            kf_p = (1 - K) * kf_p
+        self.save("kf_x", kf_x)
+        self.save("kf_p", kf_p)
+        self.fv = round(kf_x) if kf_x else 9990
 
-    TAKE_LONG_GATE = 20
-    MAKE_GATE      = 80
+        # Order book imbalance skew
+        self.imb = 0.0
+        if self.od and self.od.buy_orders and self.od.sell_orders:
+            bv = abs(list(self.od.buy_orders.values())[0])
+            av = abs(list(self.od.sell_orders.values())[0])
+            if bv + av > 0:
+                self.imb = (bv - av) / (bv + av)
 
-    def __init__(self, name: str, state: TradingState, last_td: dict, new_td: dict):
-        super().__init__(name, state, last_td, new_td)
-        p = self.params
+    def get_orders(self) -> List[Order]:
+        if not self.od or not self.bb or not self.ba:
+            return []
+        mm       = HYDROGEL_PARAMS["make_margin"]
+        beta     = HYDROGEL_PARAMS["inv_beta"]
+        fv       = self.fv
+        imb_skew = round(self.imb * HYDROGEL_PARAMS["imb_scale"])
+        sig_conf = min(1.0, abs(self.imb) / 0.3)
+        inv_skew = -round((self.pos / self.pos_limit) * beta * (1 - sig_conf))
 
-        # Adaptive FV: EMA of market mid, initialized from order book on first tick.
-        ob_mid = None
-        bb = self.get_best_bid()
-        ba = self.get_best_ask()
-        if bb is not None and ba is not None:
-            ob_mid = (bb + ba) / 2.0
+        bid_px = max(self.bb + 1, fv - mm + inv_skew + imb_skew)
+        ask_px = min(self.ba - 1, fv + mm + inv_skew + imb_skew)
+        bid_px = min(bid_px, self.ba - 1)
+        ask_px = max(ask_px, self.bb + 1)
+        if bid_px >= ask_px:
+            bid_px = ask_px - 1
+        bid_px = max(bid_px, 1)
 
-        prev_fv  = self.last_traderData.get("fv_ema", ob_mid)
-        alpha    = p.get("ema_alpha", 0.05)
-        if prev_fv is None:
-            self.fair_value = ob_mid if ob_mid else 10000.0
-        elif ob_mid is None:
-            self.fair_value = prev_fv
+        if self.imb > -0.2:
+            self.buy(bid_px, self.buy_cap)
+        if self.imb < 0.2:
+            self.sell(ask_px, self.sell_cap)
+        return self.orders
+
+
+# ── VEF Underlying Trader ─────────────────────────────────────────────────────
+# EMA-based mean reversion + passive MM.
+# Size reduced vs Strategy B to limit directional exposure.
+# Clear threshold tightened to prevent large inventory buildup.
+
+class VEFTrader(ProductTrader):
+    def __init__(self, state: TradingState, td: dict, ntd: dict, new_day: bool):
+        super().__init__(UNDERLYING, state, td, ntd, new_day)
+        ema         = self.load("ema")
+        ticks_today = self.load("ticks_today", 0)
+        if new_day or ema is None:
+            ema = self.mid
+            ticks_today = 0
+        elif self.mid:
+            alpha       = max(0.005, 0.1 * (1 - ticks_today / 500))
+            ema         = alpha * self.mid + (1 - alpha) * ema
+            ticks_today += 1
+        self.save("ema", ema)
+        self.save("ticks_today", ticks_today)
+        self.ema = ema
+        self.fv  = round(ema) if ema else None
+
+    def get_orders(self) -> List[Order]:
+        if not self.od or self.mid is None or self.fv is None:
+            return []
+        mm    = VEF_PARAMS["make_margin"]
+        clear = VEF_PARAMS["clear_pos"]
+        frac  = VEF_PARAMS["mm_size_frac"]
+        fv    = self.fv
+
+        # Range-reversion lean when price far from EMA
+        range_lean = 0
+        if self.ema:
+            dev    = self.mid - self.ema
+            thresh = VEF_PARAMS["range_k"] * VEF_PARAMS["range_std"]
+            if abs(dev) > thresh:
+                scale      = min(1.0, (abs(dev) - thresh) / thresh)
+                sign       = -1 if dev > 0 else 1
+                range_lean = int(round(sign * scale * VEF_PARAMS["range_lean"]))
+
+        # Inventory clearing
+        if self.pos > clear and self.ba:
+            self.sell(fv, min(self.pos - clear, self.sell_cap // 2))
+        elif self.pos < -clear and self.bb:
+            self.buy(fv, min(-self.pos - clear, self.buy_cap // 2))
+
+        # Directional lean
+        if range_lean > 0 and self.bb and self.ba:
+            self.buy(max(self.bb + 1, fv - mm), range_lean)
+        elif range_lean < 0 and self.bb and self.ba:
+            self.sell(min(self.ba - 1, fv + mm), -range_lean)
+
+        # Passive MM layers
+        if self.bb and self.ba:
+            for margin in [mm, mm + 2]:
+                bid2 = max(self.bb + 1, fv - margin)
+                ask2 = min(self.ba - 1, fv + margin)
+                if bid2 < ask2:
+                    sz = max(1, int(self.pos_limit * frac * 0.5))
+                    self.buy(bid2, sz)
+                    self.sell(ask2, sz)
+        return self.orders
+
+
+# ── VEV Option Trader ─────────────────────────────────────────────────────────
+# All traded strikes (5200-5500) use SELL_BIAS: structural overpricing confirmed
+# across both logs and EDA. At expiry, market bids > BS fair → collect premium.
+#
+# Removed VEV_5000/5100 from BUY_BIAS (log 538153: paid 9.3 ticks time value
+# never recovered at expiry → -97 combined loss).
+#
+# OPTION_MAX_SHORT caps per strike prevent unbounded gamma risk.
+# SELL_BIAS mode: sweep bids above BS fair aggressively (fills Mark 01/14 who
+# systematically buy calls), then passive ask at FV+make_margin.
+
+class VEVTrader(ProductTrader):
+    def __init__(self, name: str, state: TradingState, td: dict, ntd: dict,
+                 new_day: bool, S: float, T: float):
+        super().__init__(name, state, td, ntd, new_day)
+        self.strike      = int(name.split("_")[1])
+        self.S           = S
+        self.T           = T
+        self.soft_cap    = OPTION_MAX_SHORT.get(name, 0)
+        vp               = VOUCHER_PARAMS.get(name, {"take_margin": 10, "make_margin": 3})
+        self.take_margin = vp["take_margin"]
+        self.make_margin = vp["make_margin"]
+        self.iv          = smile_iv(S, self.strike, T) if S else SMILE_C
+        self.fair        = bs_call(S, self.strike, T, self.iv) if S else None
+
+        # Order book imbalance skew for passive quotes
+        self.imb_skew = 0
+        if self.od and self.od.buy_orders and self.od.sell_orders:
+            bv = abs(list(self.od.buy_orders.values())[0])
+            av = abs(list(self.od.sell_orders.values())[0])
+            if bv + av > 0:
+                self.imb_skew = round((bv - av) / (bv + av) * 1.5)
+
+    def get_orders(self) -> List[Order]:
+        if self.S is None or self.fair is None or self.soft_cap == 0:
+            return []
+        if not self.od:
+            return []
+
+        fv        = self.fair
+        intrinsic = max(self.S - self.strike, 0.0)
+        is_sell   = self.name in SELL_BIAS
+
+        if is_sell and self.od.buy_orders:
+            # Aggressively sweep all bids at or above BS fair value
+            # net short cap = OPTION_MAX_SHORT[strike]
+            for bp in sorted(self.od.buy_orders.keys(), reverse=True):
+                if bp < fv:
+                    break
+                # Remaining short room: soft_cap + current_pos (pos is negative when short)
+                short_room = self.soft_cap + self.pos
+                qty = min(abs(self.od.buy_orders[bp]), short_room, self.sell_cap)
+                if qty > 0:
+                    self.sell(bp, qty)
         else:
-            self.fair_value = (1 - alpha) * prev_fv + alpha * ob_mid
+            # Neutral MM: only take on significant dislocation
+            if self.od.sell_orders:
+                for sp in sorted(self.od.sell_orders.keys()):
+                    if sp > fv - self.take_margin:
+                        break
+                    qty = min(abs(self.od.sell_orders[sp]),
+                              self.soft_cap - self.pos, self.buy_cap)
+                    if qty > 0:
+                        self.buy(sp, qty)
+            if self.od.buy_orders:
+                for bp in sorted(self.od.buy_orders.keys(), reverse=True):
+                    if bp < fv + self.take_margin:
+                        break
+                    short_room = self.soft_cap + self.pos
+                    qty = min(abs(self.od.buy_orders[bp]), short_room, self.sell_cap)
+                    if qty > 0:
+                        self.sell(bp, qty)
 
-        self.new_traderData["fv_ema"] = self.fair_value
-
-        self.take_margin  = p.get("take_margin",  2)
-        self.clear_margin = p.get("clear_margin", 4)
-        self.make_margin  = p.get("make_margin",  3)
-
-        # Counterparty signal: detect Mark 38 direction to fade them.
-        hyd_trades = state.market_trades.get(name, [])
-        self.cp_signal = 0
-        for t in hyd_trades:
-            qty    = getattr(t, 'quantity', 0)
-            buyer  = getattr(t, 'buyer',   '')
-            seller = getattr(t, 'seller',  '')
-            if buyer in FADE_HYD:
-                # Mark 38 buying = price at local HIGH → fade = we should SELL
-                self.cp_signal -= qty
-            if seller in FADE_HYD:
-                # Mark 38 selling = price at local LOW → fade = we should BUY
-                self.cp_signal += qty
-
-    def _make_ask_price(self) -> int:
-        fair_ask = self.fair_value + self.make_margin
-        ba = self.get_best_ask()
-        if ba is None:
-            return round(fair_ask)
-        return ba - 1 if ba > fair_ask else round(fair_ask)
-
-    def _make_bid_price(self) -> int:
-        fair_bid = self.fair_value - self.make_margin
-        bb = self.get_best_bid()
-        if bb is None:
-            return round(fair_bid)
-        return bb + 1 if bb < fair_bid else round(fair_bid)
-
-    def get_orders(self) -> Dict[str, List]:
-        fv = self.fair_value
-
-        # Adjust TAKE_LONG_GATE: if Mark 38 is buying (price HIGH), reduce buy willingness
-        gate_adj      = min(15, max(-15, self.cp_signal // 2))
-        effective_gate = self.TAKE_LONG_GATE + gate_adj
-
-        # TAKE: hit overpriced bids
-        for bp, bv in self.quoted_buy_orders.items():
-            if bp < fv + self.take_margin:
-                break
-            self.sell(bp, bv)
-
-        # TAKE: lift cheap asks — gated
-        for sp, sv in self.quoted_sell_orders.items():
-            if sp > fv - self.take_margin:
-                break
-            if self.expected_position >= effective_gate:
-                break
-            self.buy(sp, sv)
-
-        # CLEAR: nudge toward zero
-        pos = self.expected_position
-        if pos > 0:
-            self.sell(fv + self.clear_margin, pos)
-        elif pos < 0:
-            self.buy(fv - self.clear_margin, -pos)
-
-        # MAKE: passive quotes — suppressed when inventory skewed
-        pos = self.expected_position
-        if self.max_allowed_sell_volume > 0 and pos > -self.MAKE_GATE:
-            self.sell(self._make_ask_price(), self.max_allowed_sell_volume)
-        if self.max_allowed_buy_volume > 0 and pos < self.MAKE_GATE:
-            self.buy(self._make_bid_price(), self.max_allowed_buy_volume)
-
-        return {self.name: self.orders}
+        # Passive MM — sell bias: sell 3× more than buy
+        if self.bb and self.ba:
+            bid_px = max(self.bb + 1, round(fv - self.make_margin + self.imb_skew))
+            ask_px = min(self.ba - 1, round(fv + self.make_margin + self.imb_skew))
+            bid_px = max(bid_px, round(intrinsic) + 1)
+            ask_px = min(ask_px, round(self.S))
+            if ask_px > bid_px:
+                short_room = self.soft_cap + self.pos
+                sell_sz = min(self.soft_cap, self.sell_cap, short_room)
+                buy_sz  = min(self.soft_cap // 3, self.buy_cap)  # 3× sell bias
+                if sell_sz > 0:
+                    self.sell(ask_px, sell_sz)
+                if buy_sz > 0:
+                    self.buy(bid_px, buy_sz)
+        return self.orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  VEV OPTIONS — TAKE-ONLY seller (intrinsic-floor + T-sanity check)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  Round 4 mispricing pattern (from EDA):
-#    Day 1 (T: 3→2): market BELOW BS by 3-5 ticks → threshold=10 blocks selling cheap
-#    Day 2 (T: 2→1): market ABOVE BS by +6-8 ticks → sell when bid > BS+5
-#    Day 3 (T: 1→0): market ABOVE BS by +20-22 ticks → sell aggressively, bid > BS+5
-#
-#  Intrinsic floor always active: sell only if bid > intrinsic + 5.
-#  This guarantees profit at settlement regardless of T_remaining accuracy.
-#
-#  NO delta hedge: log 509764 showed the hedge cost -8405, options earned +5664.
-#  On day 3 with T→0, OTM delta < 0.1, hedge spread cost > hedge benefit.
-#  Delta-neutral is only valuable if you can earn theta. Here we collect premium
-#  via the sell-at-expiry structure — no ongoing theta capture needed.
-
-def _take_threshold(T_remaining: float) -> float:
-    if T_remaining > 2.0:
-        return 10.0   # day 1: market below BS, high threshold blocks selling cheap
-    return 5.0         # days 2-3: market above BS, aggressive
-
-
-class VEVOptionSeller:
-    """
-    TAKE-ONLY options seller. No delta hedge (removed after log 509764 analysis).
-    """
-
-    def __init__(
-        self,
-        name: str,
-        strike: int,
-        state: TradingState,
-        underlying_mid: Optional[float],
-        T_remaining: float,
-        position_limit: int,
-    ):
-        self.name   = name
-        self.strike = strike
-        self.lim    = position_limit
-        self.T      = T_remaining
-        self.S      = underlying_mid
-        self.orders: List[Order] = []
-
-        self.pos      = state.position.get(name, 0)
-        self.max_sell = self.lim + self.pos
-        self.max_buy  = self.lim - self.pos
-
-        od = state.order_depths.get(name)
-        self.bids: Dict[int, int] = {}
-        self.asks: Dict[int, int] = {}
-        if od:
-            self.bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(),  key=lambda x: -x[0]) if v}
-            self.asks = {p: abs(v) for p, v in sorted(od.sell_orders.items(), key=lambda x:  x[0]) if v}
-
-        self.fair: Optional[float] = None
-        if self.S is not None:
-            if T_remaining > 0:
-                self.fair = _bs_call(self.S, self.strike, T_remaining, SIGMA)
-            else:
-                self.fair = max(float(self.S - self.strike), 0.0)
-
-        self.threshold        = _take_threshold(T_remaining)
-        self.max_option_short = OPTION_MAX_SHORT.get(strike, 75)
-
-    def _sell(self, price: int, volume: int) -> None:
-        cover_cap = max(0, self.max_option_short + self.pos)
-        vol = min(volume, self.max_sell, cover_cap)
-        if vol <= 0:
-            return
-        self.orders.append(Order(self.name, price, -vol))
-        self.max_sell -= vol
-        self.pos      -= vol
-
-    def _buy(self, price: int, volume: int) -> None:
-        cover_room = max(0, -self.pos)
-        vol = min(volume, self.max_buy, cover_room)
-        if vol <= 0:
-            return
-        self.orders.append(Order(self.name, price, vol))
-        self.max_buy -= vol
-        self.pos     += vol
-
-    def get_orders(self) -> Dict[str, List]:
-        if self.S is None:
-            return {self.name: []}
-
-        intrinsic   = max(float(self.S - self.strike), 0.0)
-        MIN_PREMIUM = 5.0
-        sell_floor  = intrinsic + MIN_PREMIUM
-
-        market_mid = None
-        if self.bids and self.asks:
-            market_mid = (next(iter(self.bids)) + next(iter(self.asks))) / 2.0
-
-        # T-sanity: if BS(T) >> market_mid, T_remaining is likely wrong (day_offset error).
-        # Fall back to intrinsic floor — guaranteed profitable at settlement.
-        t_inflated = (
-            self.fair is not None
-            and market_mid is not None
-            and self.fair > market_mid * 1.10
-        )
-
-        if t_inflated:
-            sell_trigger = sell_floor
-        elif self.fair is not None:
-            sell_trigger = max(self.fair + self.threshold, sell_floor)
-        else:
-            sell_trigger = sell_floor
-
-        # SELL: hit bids above trigger
-        for bp, bv in self.bids.items():
-            if bp < sell_trigger:
-                break
-            self._sell(bp, bv)
-
-        # COVER: buy back only at intrinsic (never pay time value)
-        for sp, sv in self.asks.items():
-            if sp > intrinsic:
-                break
-            self._buy(sp, sv)
-
-        return {self.name: self.orders}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN TRADER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main Trader ───────────────────────────────────────────────────────────────
 
 class Trader:
-    """
-    Round 4 — rebuilt after log 509764 forensic analysis.
-
-    Changes from previous version:
-      - ProductTrader cross-update bug FIXED (no more limit exceeded errors)
-      - HYDROGEL FV now adaptive (EMA of market mid, not static 9995)
-      - Delta hedge REMOVED (cost -8405 vs options +5664 in log 509764)
-      - Day detection improved: uses option price sanity check as fallback
-      - VEVUnderlyingTrader class removed entirely
-
-    Execution order each tick:
-      1. Decode state, track day_offset
-      2. Sanity-check T_remaining against option market prices
-      3. HYDROGEL — adaptive mean-reversion (adaptive FV, fixed limits)
-      4. VEV options — TAKE-ONLY selling (intrinsic-floor + BS trigger)
-    """
-
-    def _get_day_offset(self, state: TradingState, last_td: dict,
-                         underlying_mid: Optional[float]) -> int:
-        last_ts    = last_td.get("_meta", {}).get("last_timestamp", state.timestamp)
-        day_offset = last_td.get("_meta", {}).get("day_offset", 0)
-
-        if state.timestamp < last_ts:
-            day_offset += 1
-
-        # Sanity-check: if T_remaining implied by day_offset seems inconsistent
-        # with option market prices, override with estimate from option prices.
-        # This handles the "fresh start on day 3" failure from log 509764.
-        T_implied = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
-        if T_implied > 2.0 and underlying_mid is not None:
-            # Our T estimate says day 1, but let's verify against VEV_5300 price
-            est_offset = _detect_day_from_options(state, underlying_mid)
-            if est_offset is not None and est_offset > day_offset:
-                day_offset = est_offset
-
-        return day_offset
-
-    def _get_underlying_mid(self, state: TradingState) -> Optional[float]:
-        try:
-            od = state.order_depths["VELVETFRUIT_EXTRACT"]
-            bb = max(od.buy_orders.keys())
-            ba = min(od.sell_orders.keys())
-            return (bb + ba) / 2.0
-        except Exception:
-            return None
-
     def run(self, state: TradingState):
-        result: Dict[str, List[Order]] = {}
+        try:
+            td = jsonpickle.decode(state.traderData) if state.traderData else {}
+        except Exception:
+            td = {}
+        if not isinstance(td, dict):
+            td = {}
+        for p in ALL_PRODUCTS + ["_meta"]:
+            td.setdefault(p, {})
+        ntd = {p: {} for p in ALL_PRODUCTS + ["_meta"]}
+        ts  = state.timestamp
 
-        # 1. Load state
-        last_td = (jsonpickle.decode(state.traderData)
-                   if state.traderData else default_traderData())
-        new_td = default_traderData()
-        new_td.setdefault("_meta", {})
+        meta    = td.get("_meta", {})
+        day_off = meta.get("day_offset", 0)
+        last_ts = meta.get("last_timestamp")
+        new_day = last_ts is not None and ts < last_ts
+        if new_day:
+            day_off += 1
 
-        # 2. Underlying mid (needed for day detection)
-        underlying_mid = self._get_underlying_mid(state)
+        # T-remaining in calendar-year units (calibrated to SMILE parameters)
+        step_count  = meta.get("step_count", 0)
+        if new_day:
+            step_count = 0
+        T_remaining = max(INITIAL_T - step_count * STEP_SIZE_YR, 1e-6)
+        step_count += 1
+        ntd["_meta"]["step_count"] = step_count
 
-        # 3. Time tracking with option-price sanity check
-        day_offset = self._get_day_offset(state, last_td, underlying_mid)
-        new_td["_meta"]["day_offset"]     = day_offset
-        new_td["_meta"]["last_timestamp"] = state.timestamp
-        T_remaining = max(EXPIRY_DAYS - (day_offset + state.timestamp / 1_000_000), 0.0)
+        res: Dict[str, List[Order]] = {}
 
-        # 4. HYDROGEL_PACK — adaptive mean-reversion
-        hg = HydrogelTrader("HYDROGEL_PACK", state, last_td, new_td)
-        result.update(hg.get_orders())
-        hg.update_traderData()
+        # HYDROGEL: KF market-making (fills Mark 38 selectively)
+        hyd = HydrogelTrader(state, td, ntd, new_day)
+        res[HYDROGEL] = hyd.get_orders()
 
-        # 5. VEV options — TAKE-ONLY selling, no delta hedge
-        if underlying_mid is not None:
-            for K in SELL_STRIKES:
-                name = f"VEV_{K}"
-                if name not in state.order_depths:
-                    continue
-                seller = VEVOptionSeller(
-                    name=name,
-                    strike=K,
-                    state=state,
-                    underlying_mid=underlying_mid,
-                    T_remaining=T_remaining,
-                    position_limit=POS_LIMITS.get(name, 300),
-                )
-                result.update(seller.get_orders())
+        # VEF: EMA mean-reversion MM
+        vef = VEFTrader(state, td, ntd, new_day)
+        S   = vef.mid
+        res[UNDERLYING] = vef.get_orders()
 
-        # 6. Save state
-        return result, 0, jsonpickle.encode(new_td)
+        # VEV options: SELL_BIAS on all 5200-5500
+        for strike in STRIKES:
+            prod = f"VEV_{strike}"
+            if prod in TRADED_VOUCHERS and S is not None:
+                trader = VEVTrader(prod, state, td, ntd, new_day, S, T_remaining)
+                res[prod] = trader.get_orders()
+            else:
+                res[prod] = []
+
+        ntd["_meta"]["day_offset"]     = day_off
+        ntd["_meta"]["last_timestamp"] = ts
+        return res, 0, jsonpickle.encode(ntd)
