@@ -485,9 +485,10 @@ dependencies = [
     { name = "nbconvert" },
     { name = "numpy" },
     { name = "pandas" },
+    { name = "scipy" },
+    { name = "seaborn" },
     { name = "plotly" },
     { name = "prosperity4btest" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -498,6 +499,8 @@ requires-dist = [
     { name = "nbconvert", specifier = ">=7.17.1" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "pandas", specifier = ">=3.0.2" },
+    { name = "scipy", specifier = ">=1.17.1" },
+    { name = "seaborn", specifier = ">=0.13.2" },
     { name = "plotly", specifier = ">=5.24.0" },
     { name = "prosperity4btest", specifier = ">=1.0.1" },
 ]
